@@ -1,0 +1,724 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+
+	"go.yaml.in/yaml/v4"
+
+	"github.com/replicate/cog/pkg/requirements"
+	"github.com/replicate/cog/pkg/util/console"
+	"github.com/replicate/cog/pkg/util/version"
+)
+
+var (
+	BuildSourceEpochTimestamp int64 = -1
+	BuildXCachePath           string
+	PipPackageNameRegex       = regexp.MustCompile(`^([^>=<~ \n[#]+)`)
+)
+
+// TODO(andreas): support conda packages
+// TODO(andreas): support dockerfiles
+// TODO(andreas): custom cpu/gpu installs
+// TODO(andreas): suggest valid torchvision versions (e.g. if the user wants to use 0.8.0, suggest 0.8.1)
+
+const (
+	MinimumMajorPythonVersion               int    = 3
+	MinimumMinorPythonVersion               int    = 10
+	MinimumMinorPythonVersionForConcurrency int    = 11
+	MinimumMajorCudaVersion                 int    = 11
+	DefaultPythonVersion                    string = "3.13"
+)
+
+type RunItem struct {
+	Command string `json:"command,omitempty" yaml:"command"`
+	Mounts  []struct {
+		Type   string `json:"type,omitempty" yaml:"type"`
+		ID     string `json:"id,omitempty" yaml:"id"`
+		Target string `json:"target,omitempty" yaml:"target"`
+	} `json:"mounts,omitempty" yaml:"mounts,omitempty"`
+}
+
+type Build struct {
+	GPU                bool      `json:"gpu,omitempty" yaml:"gpu,omitempty"`
+	PythonVersion      string    `json:"python_version,omitempty" yaml:"python_version"`
+	PythonRequirements string    `json:"python_requirements,omitempty" yaml:"python_requirements,omitempty"`
+	PythonPackages     []string  `json:"python_packages,omitempty" yaml:"python_packages,omitempty"` // Deprecated, but included for backwards compatibility
+	Run                []RunItem `json:"run,omitempty" yaml:"run,omitempty"`
+	SystemPackages     []string  `json:"system_packages,omitempty" yaml:"system_packages,omitempty"`
+	PreInstall         []string  `json:"pre_install,omitempty" yaml:"pre_install,omitempty"` // Deprecated, but included for backwards compatibility
+	CUDA               string    `json:"cuda,omitempty" yaml:"cuda,omitempty"`
+	CuDNN              string    `json:"cudnn,omitempty" yaml:"cudnn,omitempty"`
+	// SDKVersion pins the cog Python SDK version installed in the container.
+	// Accepts a PEP 440 version string (e.g. "0.18.0" or "0.18.0a1").
+	// When empty the latest release is installed. Overridden by COG_SDK_WHEEL env var.
+	SDKVersion string `json:"sdk_version,omitempty" yaml:"sdk_version,omitempty"`
+
+	pythonRequirementsContent []string
+	localPackageArtifacts     []LocalPackageArtifact
+}
+
+// LocalPackageArtifact is a local requirement staged into the Docker build context.
+type LocalPackageArtifact struct {
+	Requirement  string // Normalized requirements-file line.
+	SourcePath   string // Canonical source path used for containment checks and reads.
+	RelativePath string // Project-relative staging path preserving the requirement filename.
+}
+
+type Concurrency struct {
+	Max int `json:"max,omitempty" yaml:"max"`
+}
+
+type Observability struct {
+	Config string   `json:"config,omitempty" yaml:"config,omitempty"`
+	Traces *Tracing `json:"traces,omitempty" yaml:"traces,omitempty"`
+}
+
+type Tracing struct {
+	Enabled           bool   `json:"enabled" yaml:"enabled"`
+	Sampler           string `json:"sampler,omitempty" yaml:"sampler,omitempty"`
+	SamplerArg        string `json:"sampler_arg,omitempty" yaml:"sampler_arg,omitempty"`
+	TraceHeader       string `json:"trace_header,omitempty" yaml:"trace_header,omitempty"`
+	TraceHeaderFormat string `json:"trace_header_format,omitempty" yaml:"trace_header_format,omitempty"`
+}
+
+// WeightSourceConfig describes where to import weights from.
+// This is the "source" sub-object inside a weights entry.
+type WeightSourceConfig struct {
+	URI     string   `json:"uri,omitempty" yaml:"uri,omitempty"`
+	Include []string `json:"include,omitempty" yaml:"include,omitempty"`
+	Exclude []string `json:"exclude,omitempty" yaml:"exclude,omitempty"`
+}
+
+// WeightSourceList accepts a single object or an array in YAML/JSON
+// and normalizes to a slice. Custom unmarshalers are in config_file.go.
+type WeightSourceList struct {
+	Items []WeightSourceConfig
+}
+
+// WeightSource defines a weight directory to include in the model.
+type WeightSource struct {
+	Name   string           `json:"name" yaml:"name"`
+	Target string           `json:"target" yaml:"target"`
+	Source WeightSourceList `json:"source" yaml:"source"`
+}
+
+// WeightNames returns the names of the given weight sources.
+func WeightNames(ws []WeightSource) []string {
+	names := make([]string, len(ws))
+	for i, w := range ws {
+		names[i] = w.Name
+	}
+	return names
+}
+
+type Config struct {
+	Build         *Build         `json:"build" yaml:"build"`
+	Image         string         `json:"image,omitempty" yaml:"image,omitempty"`
+	Model         string         `json:"model,omitempty" yaml:"model,omitempty"`
+	Predict       string         `json:"predict,omitempty" yaml:"predict"`
+	Train         string         `json:"train,omitempty" yaml:"train,omitempty"`
+	Concurrency   *Concurrency   `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
+	Observability *Observability `json:"observability,omitempty" yaml:"observability,omitempty"`
+	Environment   []string       `json:"environment,omitempty" yaml:"environment,omitempty"`
+	Weights       []WeightSource `json:"weights,omitempty" yaml:"weights,omitempty"`
+
+	parsedEnvironment map[string]string
+}
+
+func (r *RunItem) UnmarshalYAML(unmarshal func(any) error) error {
+	var commandOrMap any
+	if err := unmarshal(&commandOrMap); err != nil {
+		return err
+	}
+
+	switch v := commandOrMap.(type) {
+	case string:
+		r.Command = v
+	case map[string]any:
+		var data []byte
+		var err error
+
+		if data, err = yaml.Marshal(v); err != nil {
+			return err
+		}
+
+		aux := struct {
+			Command string `yaml:"command"`
+			Mounts  []struct {
+				Type   string `yaml:"type"`
+				ID     string `yaml:"id"`
+				Target string `yaml:"target"`
+			} `yaml:"mounts,omitempty"`
+		}{}
+
+		if err := yaml.Unmarshal(data, &aux); err != nil {
+			return err
+		}
+
+		*r = RunItem(aux)
+	default:
+		return fmt.Errorf("unexpected type %T for RunItem", v)
+	}
+
+	return nil
+}
+
+func (r *RunItem) UnmarshalJSON(data []byte) error {
+	var commandOrMap any
+	if err := json.Unmarshal(data, &commandOrMap); err != nil {
+		return err
+	}
+
+	switch v := commandOrMap.(type) {
+	case string:
+		r.Command = v
+	case map[string]any:
+		aux := struct {
+			Command string `json:"command"`
+			Mounts  []struct {
+				Type   string `json:"type"`
+				ID     string `json:"id"`
+				Target string `json:"target"`
+			} `json:"mounts,omitempty"`
+		}{}
+
+		jsonData, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+
+		if err := json.Unmarshal(jsonData, &aux); err != nil {
+			return err
+		}
+
+		*r = RunItem(aux)
+	default:
+		return fmt.Errorf("unexpected type %T for RunItem", v)
+	}
+
+	return nil
+}
+
+func (c *Config) CUDABaseImageTag() (string, error) {
+	return cudaBaseImageFor(c.Build.CUDA, c.Build.CuDNN)
+}
+
+func (c *Config) TorchVersion() (string, bool) {
+	return c.pythonPackageVersion("torch")
+}
+
+// ResolvedTorchWheel reports the torch wheel a GPU build will actually install: the exact
+// pinned version and the CUDA it was built against, read from the resolved package index
+// (e.g. .../whl/cu128 -> "12.8"). It mirrors PythonRequirementsForArch, so it reflects the
+// installed wheel rather than the raw requirement line, and falls back to Build.CUDA when the
+// resolved index carries no CUDA. Returns ok=false unless torch is pinned to one exact version.
+func (c *Config) ResolvedTorchWheel(goos string, goarch string) (torchVersion string, cuda string, ok bool) {
+	for _, pkg := range c.Build.pythonRequirementsContent {
+		if requirements.NormalizePackageName(requirements.PackageName(pkg)) != "torch" {
+			continue
+		}
+		resolved, _, extraIndexURLs, err := c.pythonPackageForArch(pkg, goos, goarch)
+		if err != nil {
+			return "", "", false
+		}
+		version, hasExact := requirements.ExactVersion(resolved)
+		if !hasExact {
+			return "", "", false
+		}
+		resolvedCUDA := c.Build.CUDA
+		for _, indexURL := range extraIndexURLs {
+			if derived, found := cudaVersionFromIndexURL(indexURL); found {
+				resolvedCUDA = derived
+				break
+			}
+		}
+		return version, resolvedCUDA, true
+	}
+	return "", "", false
+}
+
+func (c *Config) TorchvisionVersion() (string, bool) {
+	return c.pythonPackageVersion("torchvision")
+}
+
+func (c *Config) TorchaudioVersion() (string, bool) {
+	return c.pythonPackageVersion("torchaudio")
+}
+
+func (c *Config) TensorFlowVersion() (string, bool) {
+	return c.pythonPackageVersion("tensorflow")
+}
+
+func (c *Config) cudasFromTorch() (torchVersion string, torchCUDAs []string, err error) {
+	if version, ok := c.TorchVersion(); ok {
+		cudas, err := cudasFromTorch(version)
+		if err != nil {
+			return "", nil, err
+		}
+		return version, cudas, nil
+	}
+	return "", nil, nil
+}
+
+func (c *Config) cudaFromTF() (tfVersion string, tfCUDA string, tfCuDNN string, err error) {
+	if version, ok := c.TensorFlowVersion(); ok {
+		cuda, cudnn, err := cudaFromTF(version)
+		if err != nil {
+			return "", "", "", err
+		}
+		return version, cuda, cudnn, nil
+	}
+	return "", "", "", nil
+}
+
+func (c *Config) pythonPackageVersion(name string) (version string, ok bool) {
+	for _, pkg := range c.Build.pythonRequirementsContent {
+		if isLocalPackageArtifactRequirement(pkg) {
+			continue
+		}
+		pkgName := requirements.PackageName(pkg)
+		if pkgName == name {
+			versions := requirements.Versions(pkg)
+			if len(versions) > 0 {
+				return versions[0], true
+			}
+			return "", true
+		}
+	}
+	return "", false
+}
+
+func splitPythonVersion(version string) (major int, minor int, err error) {
+	version = strings.TrimSpace(version)
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("missing minor version in %s", version)
+	}
+	majorStr, minorStr := parts[0], parts[1]
+	major, err = strconv.Atoi(majorStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	minor, err = strconv.Atoi(minorStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	return major, minor, nil
+}
+
+// Complete performs CUDA resolution, requirements loading, and environment loading for a Config.
+// Use this when building a Config struct directly (not from YAML).
+// For configs loaded from YAML, use Load() instead which handles validation and completion.
+func (c *Config) Complete(projectDir string) error {
+	c.Build.pythonRequirementsContent = nil
+	c.Build.localPackageArtifacts = nil
+
+	// Validate mutual exclusion of python_packages and python_requirements
+	if len(c.Build.PythonPackages) > 0 && c.Build.PythonRequirements != "" {
+		return fmt.Errorf("only one of python_packages or python_requirements can be set in your cog.yaml, not both")
+	}
+
+	// Load python_requirements into memory to simplify reading it multiple times
+	if c.Build.PythonRequirements != "" {
+		requirementsFilePath := c.Build.PythonRequirements
+		if !strings.HasPrefix(requirementsFilePath, "/") {
+			requirementsFilePath = filepath.Join(projectDir, c.Build.PythonRequirements)
+		}
+		reqs, err := requirements.ReadRequirements(requirementsFilePath)
+		if err != nil {
+			return fmt.Errorf("failed to open python_requirements file: %w", err)
+		}
+		c.Build.pythonRequirementsContent = reqs
+	} else if len(c.Build.PythonPackages) > 0 {
+		// Backwards compatibility: if using deprecated python_packages, populate requirements content
+		c.Build.pythonRequirementsContent = c.Build.PythonPackages
+	}
+
+	// Resolve CUDA/CuDNN versions if GPU is enabled
+	if c.Build.GPU {
+		if err := c.validateAndCompleteCUDA(); err != nil {
+			return err
+		}
+	}
+
+	// Parse and validate environment variables
+	if err := c.loadEnvironment(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ResolveLocalPackageArtifacts validates local requirements for a generated Dockerfile
+// and replaces the artifacts returned by LocalPackageArtifacts.
+func (c *Config) ResolveLocalPackageArtifacts(projectDir string) error {
+	c.Build.localPackageArtifacts = nil
+	if c.Build.PythonRequirements == "" {
+		return nil
+	}
+
+	requirementsFilePath := c.Build.PythonRequirements
+	if !filepath.IsAbs(requirementsFilePath) {
+		requirementsFilePath = filepath.Join(projectDir, requirementsFilePath)
+	}
+	return c.loadLocalPackageArtifacts(projectDir, requirementsFilePath)
+}
+
+func (c *Config) loadLocalPackageArtifacts(projectDir string, requirementsFilePath string) error {
+	projectRoot, err := filepath.Abs(projectDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve project directory: %w", err)
+	}
+	projectRoot, err = filepath.EvalSymlinks(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to resolve project directory symlinks: %w", err)
+	}
+
+	requirementsDir := filepath.Dir(requirementsFilePath)
+	artifacts := []LocalPackageArtifact{}
+	for _, line := range c.Build.pythonRequirementsContent {
+		requirement := strings.TrimSpace(line)
+		artifactPath, ok, err := requirements.ParseLocalArtifactRequirement(requirement)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+
+		resolvedPath := artifactPath
+		if !filepath.IsAbs(resolvedPath) {
+			resolvedPath = filepath.Join(requirementsDir, resolvedPath)
+		}
+		absPath, err := filepath.Abs(resolvedPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve local Python package artifact %q: %w", artifactPath, err)
+		}
+		resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(absPath))
+		if err != nil {
+			return fmt.Errorf("local Python package artifact %q not found: %w", artifactPath, err)
+		}
+		stagedPath := filepath.Join(resolvedParent, filepath.Base(absPath))
+		if !pathWithin(projectRoot, stagedPath) {
+			return fmt.Errorf("local Python package artifact %q must be inside the project directory", artifactPath)
+		}
+		canonicalPath, err := filepath.EvalSymlinks(absPath)
+		if err != nil {
+			return fmt.Errorf("local Python package artifact %q not found: %w", artifactPath, err)
+		}
+		info, err := os.Stat(canonicalPath)
+		if err != nil {
+			return fmt.Errorf("failed to inspect local Python package artifact %q: %w", artifactPath, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("local Python package artifact %q must be a regular file", artifactPath)
+		}
+		if !pathWithin(projectRoot, canonicalPath) {
+			return fmt.Errorf("local Python package artifact %q must be inside the project directory", artifactPath)
+		}
+
+		relPath, err := filepath.Rel(projectRoot, stagedPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve local Python package artifact %q relative to project directory: %w", artifactPath, err)
+		}
+		artifacts = append(artifacts, LocalPackageArtifact{
+			Requirement:  requirement,
+			SourcePath:   canonicalPath,
+			RelativePath: relPath,
+		})
+	}
+	c.Build.localPackageArtifacts = artifacts
+	return nil
+}
+
+func pathWithin(root string, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// PythonRequirementsForArch returns a requirements.txt file with all the GPU packages resolved for given OS and architecture.
+func (c *Config) PythonRequirementsForArch(goos string, goarch string, includePackages []string) (string, error) {
+	packages := []string{}
+	findLinksSet := map[string]bool{}
+	extraIndexURLSet := map[string]bool{}
+
+	includePackageNames := []string{}
+	for _, pkg := range includePackages {
+		packageName := requirements.PackageName(pkg)
+		includePackageNames = append(includePackageNames, packageName)
+	}
+
+	// Include all the requirements and remove our include packages if they exist
+	for _, pkg := range c.Build.pythonRequirementsContent {
+		archPkg, findLinksList, extraIndexURLs, err := c.pythonPackageForArch(pkg, goos, goarch)
+		if err != nil {
+			return "", err
+		}
+		packages = append(packages, archPkg)
+		if len(findLinksList) > 0 {
+			for _, fl := range findLinksList {
+				findLinksSet[fl] = true
+			}
+		}
+		if len(extraIndexURLs) > 0 {
+			for _, u := range extraIndexURLs {
+				extraIndexURLSet[u] = true
+			}
+		}
+
+		packageName := ""
+		if !isLocalPackageArtifactRequirement(archPkg) {
+			packageName = requirements.PackageName(archPkg)
+		}
+		if packageName != "" {
+			foundIdx := -1
+			for i, includePkg := range includePackageNames {
+				if includePkg == packageName {
+					foundIdx = i
+					break
+				}
+			}
+			if foundIdx != -1 {
+				includePackageNames = append(includePackageNames[:foundIdx], includePackageNames[foundIdx+1:]...)
+				includePackages = append(includePackages[:foundIdx], includePackages[foundIdx+1:]...)
+			}
+		}
+	}
+
+	// If we still have some include packages add them in
+	packages = append(packages, includePackages...)
+
+	// Create final requirements.txt output
+	// Put index URLs first
+	lines := []string{}
+	for findLinks := range findLinksSet {
+		lines = append(lines, "--find-links "+findLinks)
+	}
+	for extraIndexURL := range extraIndexURLSet {
+		lines = append(lines, "--extra-index-url "+extraIndexURL)
+	}
+
+	// Then, everything else
+	lines = append(lines, packages...)
+
+	return strings.Join(lines, "\n"), nil
+}
+
+func isLocalPackageArtifactRequirement(requirement string) bool {
+	_, ok, err := requirements.ParseLocalArtifactRequirement(requirement)
+	return err != nil || ok
+}
+
+// pythonPackageForArch takes a package==version line and
+// returns a package==version and index URL resolved to the correct GPU package for the given OS and architecture
+func (c *Config) pythonPackageForArch(pkg, goos, goarch string) (actualPackage string, findLinksList []string, extraIndexURLs []string, err error) {
+	if isLocalPackageArtifactRequirement(pkg) {
+		return pkg, []string{}, []string{}, nil
+	}
+	name, version, findLinksList, extraIndexURLs, err := requirements.SplitPinnedPythonRequirement(pkg)
+	if err != nil {
+		// It's not pinned, so just return the line verbatim
+		return pkg, []string{}, []string{}, nil
+	}
+	if len(extraIndexURLs) > 0 {
+		return name + "==" + version, findLinksList, extraIndexURLs, nil
+	}
+
+	extraIndexURL := ""
+	findLinks := ""
+	switch name {
+	case "tensorflow":
+		if c.Build.GPU {
+			name, version, err = tfGPUPackage(version, c.Build.CUDA)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		}
+		// There is no CPU case for tensorflow because the default package is just the CPU package, so no transformation of version is needed
+	case "torch":
+		if c.Build.GPU {
+			name, version, findLinks, extraIndexURL, err = torchGPUPackage(version, c.Build.CUDA)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		} else {
+			name, version, findLinks, extraIndexURL, err = torchCPUPackage(version, goos, goarch)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		}
+	case "torchvision":
+		if c.Build.GPU {
+			name, version, findLinks, extraIndexURL, err = torchvisionGPUPackage(version, c.Build.CUDA)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		} else {
+			name, version, findLinks, extraIndexURL, err = torchvisionCPUPackage(version, goos, goarch)
+			if err != nil {
+				return "", nil, nil, err
+			}
+		}
+	}
+	pkgWithVersion := name
+	if version != "" {
+		pkgWithVersion += "==" + version
+	}
+	if extraIndexURL != "" {
+		extraIndexURLs = []string{extraIndexURL}
+	}
+	if findLinks != "" {
+		findLinksList = []string{findLinks}
+	}
+	return pkgWithVersion, findLinksList, extraIndexURLs, nil
+}
+
+func validateCudaVersion(cudaVersion string) error {
+	parts := strings.Split(cudaVersion, ".")
+	if len(parts) < 2 {
+		return fmt.Errorf("CUDA version %q must include both major and minor versions", cudaVersion)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return fmt.Errorf("invalid major version in CUDA version %q", cudaVersion)
+	}
+
+	_, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return fmt.Errorf("invalid minor version in CUDA version %q", cudaVersion)
+	}
+
+	if major < MinimumMajorCudaVersion {
+		return fmt.Errorf("minimum supported CUDA version is %d, requested %q", MinimumMajorCudaVersion, cudaVersion)
+	}
+	return nil
+}
+
+func (c *Config) validateAndCompleteCUDA() error {
+	if c.Build.CUDA != "" {
+		if err := validateCudaVersion(c.Build.CUDA); err != nil {
+			return err
+		}
+	}
+
+	if c.Build.CUDA != "" && c.Build.CuDNN != "" {
+		compatibleCuDNNs := compatibleCuDNNsForCUDA(c.Build.CUDA)
+		if !slices.Contains(compatibleCuDNNs, c.Build.CuDNN) {
+			return fmt.Errorf(`the specified CUDA version %s is not compatible with CuDNN %s.
+Compatible CuDNN versions are: %s`, c.Build.CUDA, c.Build.CuDNN, strings.Join(compatibleCuDNNs, ","))
+		}
+	}
+
+	torchVersion, torchCUDAs, err := c.cudasFromTorch()
+	if err != nil {
+		return err
+	}
+	tfVersion, tfCUDA, tfCuDNN, err := c.cudaFromTF()
+	if err != nil {
+		return err
+	}
+	// The pre-compiled TensorFlow binaries requires specific CUDA/CuDNN versions to be
+	// installed, but Torch bundles their own CUDA/CuDNN libraries.
+
+	switch {
+	case tfVersion != "":
+		switch {
+		case c.Build.CUDA == "":
+			if tfCuDNN == "" {
+				return fmt.Errorf("cog doesn't know what CUDA version is compatible with tensorflow==%s. You might need to upgrade Cog: https://github.com/replicate/cog#upgrade\n\nIf that doesn't work, you need to set the 'cuda' option in cog.yaml to set what version to use. You might be able to find this out from https://www.tensorflow.org/", tfVersion)
+			}
+			console.Debugf("Setting CUDA to version %s from Tensorflow version", tfCUDA)
+			c.Build.CUDA = tfCUDA
+		case tfCUDA == "" || version.EqualMinor(tfCUDA, c.Build.CUDA):
+			console.Warnf("Cog doesn't know if CUDA %s is compatible with Tensorflow %s. This might cause CUDA problems.", c.Build.CUDA, tfVersion)
+			if tfCUDA != "" {
+				console.Warnf("Try %s instead?", tfCUDA)
+			}
+		}
+
+		switch {
+		case c.Build.CuDNN == "" && tfCuDNN != "":
+			console.Debugf("Setting CuDNN to version %s from Tensorflow version", tfCuDNN)
+			c.Build.CuDNN = tfCuDNN
+		case c.Build.CuDNN == "":
+			c.Build.CuDNN, err = latestCuDNNForCUDA(c.Build.CUDA)
+			if err != nil {
+				return err
+			}
+			console.Debugf("Setting CuDNN to version %s", c.Build.CUDA)
+		case tfCuDNN != c.Build.CuDNN:
+			console.Warnf("Cog doesn't know if cuDNN %s is compatible with Tensorflow %s. This might cause CUDA problems.", c.Build.CuDNN, tfVersion)
+			return fmt.Errorf(`the specified cuDNN version %s is not compatible with tensorflow==%s.
+Compatible cuDNN version is: %s`, c.Build.CuDNN, tfVersion, tfCuDNN)
+		}
+	case torchVersion != "":
+		switch {
+		case c.Build.CUDA == "":
+			if len(torchCUDAs) == 0 {
+				return fmt.Errorf("cog doesn't know what CUDA version is compatible with torch==%s. You might need to upgrade Cog: https://github.com/replicate/cog#upgrade\n\nIf that doesn't work, you need to set the 'cuda' option in cog.yaml to set what version to use. You might be able to find this out from https://pytorch.org/", torchVersion)
+			}
+			c.Build.CUDA = latestCUDAFrom(torchCUDAs)
+			console.Debugf("Setting CUDA to version %s from Torch version", c.Build.CUDA)
+		case !slices.ContainsFunc(torchCUDAs, func(torchCUDA string) bool { return version.EqualMinor(torchCUDA, c.Build.CUDA) }):
+			// TODO: can we suggest a CUDA version known to be compatible?
+			console.Warnf("Cog doesn't know if CUDA %s is compatible with PyTorch %s. This might cause CUDA problems.", c.Build.CUDA, torchVersion)
+			if len(torchCUDAs) > 0 {
+				console.Warnf("Try %s instead?", torchCUDAs[len(torchCUDAs)-1])
+			}
+		}
+
+		if c.Build.CuDNN == "" {
+			c.Build.CuDNN, err = latestCuDNNForCUDA(c.Build.CUDA)
+			if err != nil {
+				return err
+			}
+			console.Debugf("Setting CuDNN to version %s", c.Build.CUDA)
+		}
+	default:
+		if c.Build.CUDA == "" {
+			c.Build.CUDA = defaultCUDA()
+			console.Debugf("Setting CUDA to version %s", c.Build.CUDA)
+		}
+		if c.Build.CuDNN == "" {
+			c.Build.CuDNN, err = latestCuDNNForCUDA(c.Build.CUDA)
+			if err != nil {
+				return err
+			}
+			console.Debugf("Setting CuDNN to version %s", c.Build.CUDA)
+		}
+	}
+
+	return nil
+}
+
+func (c *Config) RequirementsFile(projectDir string) string {
+	return filepath.Join(projectDir, c.Build.PythonRequirements)
+}
+
+func (c *Config) LocalPackageArtifacts() []LocalPackageArtifact {
+	if c.Build == nil {
+		return nil
+	}
+	return slices.Clone(c.Build.localPackageArtifacts)
+}
+
+func (c *Config) ParsedEnvironment() map[string]string {
+	return c.parsedEnvironment
+}
+
+func (c *Config) loadEnvironment() error {
+	env, err := parseAndValidateEnvironment(c.Environment)
+	if err != nil {
+		return err
+	}
+	c.parsedEnvironment = env
+	return nil
+}

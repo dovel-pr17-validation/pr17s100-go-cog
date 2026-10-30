@@ -1,0 +1,233 @@
+# Getting started
+
+This guide will walk you through what you can do with Cog by using an example model.
+If you'd rather start from a complete example, browse the
+[examples in the Cog repository](examples.md).
+
+> [!TIP]
+> Using a language model to help you write the code for your new Cog model?
+>
+> Feed it [https://cog.run/llms.txt](https://cog.run/llms.txt), which has all of Cog's documentation bundled into a single file. To learn more about this format, check out [llmstxt.org](https://llmstxt.org).
+
+## Prerequisites
+
+- **Cog**. If you haven't already installed Cog, follow the [install instructions in the README](../README.md#install).
+- **macOS, Linux, or Windows 11**. Cog works on macOS and Linux. It also works on Windows 11 with [WSL 2](wsl2/wsl2.md).
+- **Docker**. Cog uses Docker to create a container for your model. You'll need to [install Docker](https://docs.docker.com/get-docker/) before you can run Cog.
+
+## Create a project
+
+Let's make a directory to work in:
+
+```bash
+mkdir cog-quickstart
+cd cog-quickstart
+
+```
+
+## Run commands
+
+The simplest thing you can do with Cog is run a command inside a Docker environment.
+
+The first thing you need to do is create a file called `cog.yaml`:
+
+```yaml
+build:
+  python_version: "3.13"
+```
+
+Then, you can run any command inside this environment. For example, enter
+
+```bash
+cog exec python
+
+```
+
+and you'll get an interactive Python shell:
+
+```none
+✓ Building Docker image from cog.yaml... Successfully built 8f54020c8981
+Running 'python' in Docker with the current directory mounted as a volume...
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Python 3.13.x (main, ...)
+[GCC 12.2.0] on linux
+Type "help", "copyright", "credits" or "license" for more information.
+>>>
+```
+
+(Hit Ctrl-D to exit the Python shell.)
+
+Inside this Docker environment you can do anything – run a Jupyter notebook, your training script, your evaluation script, and so on.
+
+## Run a model
+
+Let's pretend we've trained a model. With Cog, we can define how to run it in a standard way, so other people can easily run it without having to hunt around for a run script.
+
+We need to write some code to describe how the model runs.
+
+Save this to `run.py`:
+
+```python
+import os
+os.environ["TORCH_HOME"] = "."
+
+import torch
+from cog import BaseRunner, Input, Path
+from PIL import Image
+from torchvision import models
+
+WEIGHTS = models.ResNet50_Weights.IMAGENET1K_V1
+
+
+class Runner(BaseRunner):
+    def setup(self):
+        """Load the model into memory to make running multiple inferences efficient"""
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = models.resnet50(weights=WEIGHTS).to(self.device)
+        self.model.eval()
+
+    def run(self, image: Path = Input(description="Image to classify")) -> dict:
+        """Run the model"""
+        img = Image.open(image).convert("RGB")
+        preds = self.model(WEIGHTS.transforms()(img).unsqueeze(0).to(self.device))
+        top3 = preds[0].softmax(0).topk(3)
+        categories = WEIGHTS.meta["categories"]
+        return {categories[i]: p.detach().item() for p, i in zip(*top3)}
+```
+
+We also need to point Cog at this, and tell it what Python dependencies to install.
+
+Save this to `requirements.txt`:
+
+```
+pillow==11.1.0
+torch==2.6.0
+torchvision==0.21.0
+```
+
+Then update `cog.yaml` to look like this:
+
+```yaml
+build:
+  python_version: "3.13"
+  python_requirements: requirements.txt
+run: "run.py:Runner"
+```
+
+> [!TIP]
+> If you have a machine with an NVIDIA GPU attached, add `gpu: true` to the `build` section of your `cog.yaml` to enable GPU acceleration.
+
+Let's grab an image to test the model with:
+
+```bash
+IMAGE_URL=https://gist.githubusercontent.com/bfirsh/3c2115692682ae260932a67d93fd94a8/raw/56b19f53f7643bb6c0b822c410c366c3a6244de2/mystery.jpg
+curl $IMAGE_URL > input.jpg
+
+```
+
+Now, let's run the model using Cog:
+
+```bash
+cog run -i image=@input.jpg
+
+```
+
+If you see the following output
+
+```json
+{
+  "tiger_cat": 0.4874822497367859,
+  "tabby": 0.23169134557247162,
+  "Egyptian_cat": 0.09728282690048218
+}
+```
+
+then it worked!
+
+Note: The first time you run `cog run`, the build process will be triggered to generate a Docker container that can run your model. The next time you run `cog run` the pre-built container will be used.
+
+## Build an image
+
+We can bake your model's code, the trained weights, and the Docker environment into a Docker image. This image serves an HTTP server, and can be deployed to anywhere that Docker runs to serve real-time inference.
+
+By default, Cog builds on top of a [prebuilt base image](base-images.md) that includes Python and common system libraries. This significantly reduces cold boot times when deploying your model.
+
+### Exclude files with `.dockerignore`
+
+When Cog builds an image, it uses your project directory as the Docker build context. Files in that context can be copied into the image, including local files that your model does not need at runtime.
+
+Add a `.dockerignore` file next to `cog.yaml` to exclude files and directories from the build context. Cog uses the standard [Docker ignore-file syntax](https://docs.docker.com/build/concepts/context/#dockerignore-files). For example:
+
+```dockerignore
+# Local Python environments and caches
+.venv/
+__pycache__/
+
+# Development-only data and generated output
+test-data/
+outputs/
+```
+
+Excluding unnecessary files makes the build context smaller, can speed up builds, and prevents those files from increasing the final image size. `cog init` creates a `.dockerignore` with common defaults for new projects.
+
+Do not exclude source files, requirements files, or model weights that your model needs at build time or runtime. Files excluded by `.dockerignore` are not available to commands in the `build.run` section of `cog.yaml` either.
+
+```bash
+cog build -t resnet
+# Building Docker image...
+# Built resnet:latest
+
+```
+
+You can run this image with `cog run` by passing the filename as an argument:
+
+```bash
+cog run resnet -i image=@input.jpg
+
+```
+
+Or, you can run it with Docker directly, and it'll serve an HTTP server:
+
+```bash
+docker run -d --rm -p 5000:5000 resnet
+
+```
+
+We can send inputs directly with `curl`:
+
+```bash
+curl http://localhost:5000/predictions -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input": {"image": "https://gist.githubusercontent.com/bfirsh/3c2115692682ae260932a67d93fd94a8/raw/56b19f53f7643bb6c0b822c410c366c3a6244de2/mystery.jpg"}}'
+
+```
+
+As a shorthand, you can add the Docker image's name as an extra line in `cog.yaml`:
+
+```yaml
+image: "r8.im/replicate/resnet"
+```
+
+Once you've done this, you can use `cog push` to build and push the image to a Docker registry:
+
+```bash
+cog push
+# Building r8.im/replicate/resnet...
+# Pushing r8.im/replicate/resnet...
+# Pushed!
+```
+
+The Docker image is now accessible to anyone or any system that has access to this Docker registry.
+
+> [!TIP]
+> `cog push` uses a [prebuilt Cog base image](base-images.md) by default for faster cold boots. If you run into build issues, try disabling it with `--use-cog-base-image=false`.
+
+## Next steps
+
+Those are the basics! Next, you might want to take a look at:
+
+- [A guide to help you set up your own model on Cog.](getting-started-own-model.md)
+- [A guide explaining how to deploy a model.](deploy.md)
+- [Reference for `cog.yaml`](yaml.md)
+- [Reference for the Python library](python.md)

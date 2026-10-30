@@ -1,0 +1,63 @@
+/cog
+.ipynb_checkpoints/
+Untitled*.ipynb
+__pycache__
+.cog
+.hypothesis/
+build
+dist
+*.egg-info
+pkg/wheels/*.whl
+# Used by a vim plugin (projectionist)
+.projections.json
+.tox/
+.venv/
+.idea/
+.DS_Store
+docs/README.md
+docs/CONTRIBUTING.md
+.docs-build/
+.docs-build-mkdocs.yml
+venv
+base-image
+flag_file
+
+bin/*
+.beads/
+
+# Auto-:d version files from setuptools-scm
+python/cog/_version.py
+coglet/python/coglet/_version.py
+cog-dataclass/python/cog/_version.py
+
+# Built coglet-server binaries
+coglet/python/cog/bin/
+
+# Local planning files
+docs/plans/**
+
+# Local agent files
+AGENTS.local.md
+CLAUDE.local.md
+
+# Local mise files
+mise.local.toml
+mise.local.lock
+
+# Built extension modules
+*.so
+*.pyd
+
+# Ignore rust specific build artifacts
+target
+/.cargo-home
+/.cargo-home/**
+/.rustup
+/.rustup/**
+.coverage
+
+# Generated docs
+/site
+
+node_modules/
+/playground/coverage/

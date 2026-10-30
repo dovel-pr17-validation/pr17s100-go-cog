@@ -1,0 +1,31 @@
+# Test wheel resolution from environment variables
+#
+# This test verifies that COG_SDK_WHEEL and COGLET_WHEEL environment variables
+# correctly resolve wheel paths, including:
+# - COG_SDK_WHEEL pointing to a directory resolves wheels inside it
+# - Clear errors when wheel not found
+#
+# Note: Tests run from a temp directory, so we use $REPO_ROOT/dist
+# (an absolute path exported by the test harness) to find wheels.
+
+# Test 1: COG_SDK_WHEEL pointing to repo dist/ directory finds wheel
+env COG_SDK_WHEEL=$REPO_ROOT/dist
+cog build --debug -t $TEST_IMAGE
+stderr 'Using local cog wheel:'
+
+# Test 2: Relative path that doesn't exist gives clear error  
+env COG_SDK_WHEEL=./nonexistent/wheel.whl
+! cog build -t $TEST_IMAGE
+stderr 'path not found'
+
+-- cog.yaml --
+build:
+  python_version: "3.12"
+predict: "predict.py:Predictor"
+
+-- predict.py --
+from cog import BasePredictor
+
+class Predictor(BasePredictor):
+    def predict(self, s: str) -> str:
+        return "hello " + s

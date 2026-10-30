@@ -1,0 +1,27 @@
+# Test that cog falls back to a CUDA base image (not cog-base) when the
+# torch version is below the minimum supported for cog-base images.
+# Torch 1.13.0 < MinimumTorchVersion (1.13.1), so no cog-base match exists.
+#
+# GHCR has no cog-base image for torch 1.13.0 (it's below minimum),
+# so the lookup fails and cog falls back to nvidia/cuda.
+
+# Generate Dockerfile — should fall back to nvidia/cuda, not cog-base
+cog debug
+stdout 'FROM nvidia/cuda'
+! stdout 'cog-base'
+
+-- cog.yaml --
+build:
+  gpu: true
+  python_version: "3.10"
+  python_packages:
+    - "torch==1.13.0"
+predict: "predict.py:Predictor"
+
+-- predict.py --
+from cog import BasePredictor
+
+
+class Predictor(BasePredictor):
+    def predict(self, s: str) -> str:
+        return "hello " + s

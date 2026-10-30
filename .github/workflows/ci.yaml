@@ -1,0 +1,875 @@
+name: CI
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-progress runs for PRs, queue for merge group and main
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}-v2
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Strict lockfile mode: fail if mise.lock is missing entries for the current
+  # platform instead of silently resolving and rewriting the lockfile.
+  MISE_LOCKED: "1"
+  # Single source of truth for supported Python versions
+  SUPPORTED_PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
+  # Default Python version for non-matrix jobs
+  PYTHON_VERSION: "3.13"
+  # Minimum supported Python — used for ABI3 wheel builds and glob patterns.
+  # Must match the lowest entry in SUPPORTED_PYTHONS.
+  MINIMUM_PYTHON: "3.10"
+  # Number of runners to shard integration tests across (per runtime)
+  # Slow tests ([short] skip) are distributed round-robin first, then fast tests fill in
+  NUM_IT_RUNNER_SHARDS: "4"
+  # Standard environment
+  HYPOTHESIS_PROFILE: ci
+  FORCE_COLOR: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
+  CARGO_TERM_COLOR: always
+  # CGo required for go-tree-sitter (static Python schema parser)
+  CGO_ENABLED: "1"
+  # Note: do NOT add rustup/rustup-init to MISE_DISABLE_TOOLS — mise needs
+  # them to install Rust components (rustfmt, clippy) specified in mise.toml.
+  #
+  # mise cache caveats:
+  #   mise-action caches ~/.local/share/mise but NOT external tool state:
+  #   - ~/.rustup (Rust toolchain + components like rustfmt, clippy)
+  #   - pipx/uv venvs (nox binary is a wrapper pointing to a venv outside mise)
+  #   On cache hit, mise sees tools as "installed" and skips reinstall, but
+  #   the actual binaries are missing. Affected jobs must force-reinstall:
+  #   - Rust jobs: `rustup component add rustfmt clippy`
+  #   - lint-python: `mise install pipx:nox --force`
+  #
+  # mise cache keys: each job uses its own key (mise-ci-{job_id}) so parallel
+  # jobs don't race on a single shared cache entry.
+
+permissions: {}
+
+jobs:
+  # Passthrough for SUPPORTED_PYTHONS — env context is unavailable in
+  # strategy.matrix, so matrix jobs reference this job's output instead.
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      supported_pythons: ${{ env.SUPPORTED_PYTHONS }}
+      playground_changed: ${{ steps.playground-changes.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: echo "supported_pythons=$SUPPORTED_PYTHONS"
+      - name: Check playground changes
+        id: playground-changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$GITHUB_SHA" -- \
+            .github/workflows/ci.yaml \
+            .github/workflows/release-build.yaml \
+            .github/dependabot.yml \
+            .gitignore \
+            mise.lock \
+            mise.toml \
+            playground \
+            'pkg/cli/playground*' \
+            pkg/cli/playground \
+            pkg/cli/root.go; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+# =============================================================================
+# Version Check - Validates VERSION.txt format and sync
+# =============================================================================
+
+  version-check:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate version
+        run: |
+          # Read canonical version from VERSION.txt
+          if [ ! -f VERSION.txt ]; then
+            echo "::error::VERSION.txt not found"
+            exit 1
+          fi
+          VERSION=$(tr -d '[:space:]' < VERSION.txt)
+          echo "VERSION.txt: $VERSION"
+          
+          # Validate semver format
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid version format: $VERSION"
+            echo "::error::Expected semver format: MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-prerelease"
+            exit 1
+          fi
+          echo "✓ Valid semver format"
+          
+          # Check VERSION.txt matches crates/Cargo.toml
+          CARGO_VERSION=$(grep '^version = ' crates/Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Version mismatch! VERSION.txt has $VERSION but crates/Cargo.toml has $CARGO_VERSION"
+            echo "::error::Run 'mise run version:bump $VERSION' to sync."
+            exit 1
+          fi
+          echo "✓ VERSION.txt matches crates/Cargo.toml"
+          
+          # Get the highest existing stable version tag
+          HIGHEST_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -v '-' | sed 's/^v//' | sort -V | tail -1)
+          if [ -n "$HIGHEST_TAG" ]; then
+            echo "Highest released version: $HIGHEST_TAG"
+            
+            # Check it's not a downgrade (using sort -V for proper semver comparison)
+            BASE_VERSION="${VERSION%%-*}"
+            SORTED_HIGHEST=$(printf '%s\n%s' "$HIGHEST_TAG" "$BASE_VERSION" | sort -V | tail -1)
+            if [ "$SORTED_HIGHEST" = "$HIGHEST_TAG" ] && [ "$HIGHEST_TAG" != "$BASE_VERSION" ]; then
+              echo "::error::Cannot downgrade version from $HIGHEST_TAG to $VERSION"
+              echo "::error::New version must be greater than the highest released version."
+              exit 1
+            fi
+            echo "✓ Version is not a downgrade"
+          else
+            echo "No existing version tags found"
+          fi
+          
+          echo ""
+          echo "✓ Version $VERSION is valid for release"
+
+# =============================================================================
+# Build Stage - Produces artifacts for downstream jobs
+# =============================================================================
+
+  build-sdk:
+    name: Build SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Build SDK
+        run: mise run ci:build:sdk
+      - name: Upload SDK package
+        uses: actions/upload-artifact@v6
+        with:
+          name: CogPackage
+          path: dist/cog-*
+
+  build-rust:
+    name: Build coglet wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # maturin-action bundles maturin and zig inside a manylinux container.
+      # Explicitly request MINIMUM_PYTHON inside the container so maturin
+      # produces an ABI3 wheel (cp310-abi3). Without this, maturin picks up
+      # the container's default Python (3.8), which doesn't support ABI3.
+      - name: Build coglet wheel (ABI3)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64-unknown-linux-gnu
+          args: --release --out dist -m crates/coglet-python/Cargo.toml --interpreter python${{ env.MINIMUM_PYTHON }}
+          manylinux: auto
+      - name: Verify ABI3 wheel exists
+        run: |
+          CPVER="cp${MINIMUM_PYTHON//.}"
+          ls -la dist/coglet-*-${CPVER}-abi3-*.whl
+      - name: Upload coglet wheel
+        uses: actions/upload-artifact@v6
+        with:
+          name: CogletRustWheel
+          # ABI3 wheels use cpXYZ-abi3 naming; just match any abi3 wheel
+          path: dist/coglet-*-abi3-*.whl
+
+  build-cog:
+    name: Build cog CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Get version from VERSION.txt
+        id: version
+        run: echo "version=$(tr -d '[:space:]' < VERSION.txt)" >> "$GITHUB_OUTPUT"
+      - name: Build cog binary
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: build --clean --snapshot --single-target --id cog --output cog
+        env:
+          GOFLAGS: -buildvcs=false
+          # Use VERSION.txt as version source so snapshot builds match the wheel version
+          COG_VERSION: ${{ steps.version.outputs.version }}
+      - name: Upload cog binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: CogBinary
+          path: cog
+
+  test-playground:
+    name: Test playground
+    needs: setup
+    if: needs.setup.outputs.playground_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Test playground
+        env:
+          # mise does not generate lock entries for task-local tools. Keep the
+          # exact versions pinned on the playground tasks without making Node
+          # part of every root CI job.
+          MISE_LOCKED: 0
+        run: |
+          mise run fmt:playground
+          mise run lint:playground
+          mise run typecheck:playground
+          mise run test:playground
+          mise run build:playground:check
+          go test ./pkg/cli -run '^TestPlayground' -count=1
+# =============================================================================
+# Format Checks - Fast, parallel
+# =============================================================================
+
+  fmt-go:
+    name: Format Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check Go formatting
+        run: mise run fmt:go
+
+  fmt-rust:
+    name: Format Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Ensure Rust components
+        run: rustup component add rustfmt clippy
+      - name: Check Rust formatting
+        run: mise run fmt:rust
+
+  fmt-python:
+    name: Format Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check Python formatting
+        run: mise run fmt:python
+
+  check-llm-docs:
+    name: Check LLM docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check llms.txt is up to date
+        run: mise run docs:llm:check
+      - name: Check CLI docs are up to date
+        run: mise run docs:cli:check
+
+  check-stubs:
+    name: Check stubs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # setup-python provides a shared-library Python (libpython3.x.so) needed
+      # by stub_gen at runtime (PyO3 auto-initialize). mise's
+      # python-build-standalone is statically linked and doesn't ship the .so.
+      - uses: actions/setup-python@v7
+        id: setup-python
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: py-${{ steps.setup-python.outputs.python-version }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check stubs are up to date
+        run: |
+          # stub_gen links libpython dynamically; tell the linker where to find it.
+          # PyO3 also caches the discovered libpython path in Rust build artifacts,
+          # so force PyO3's build config to refresh after restoring target/ from cache.
+          export PYO3_PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
+          export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          (cd crates && cargo clean -p pyo3-build-config -p pyo3-ffi)
+          mise run --force stub:check
+
+# =============================================================================
+# Lint Checks - Parallel
+# =============================================================================
+
+  lint-go:
+    name: Lint Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Lint Go
+        run: mise run lint:go
+
+  lint-rust:
+    name: Lint Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Ensure Rust components
+        run: rustup component add rustfmt clippy
+      - name: Lint Rust (clippy)
+        run: mise run lint:rust
+
+  lint-rust-deny:
+    name: Lint Rust (deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check licenses, bans, and sources
+        run: cargo deny --manifest-path crates/Cargo.toml check bans licenses sources
+
+  # Advisory checks run against a live database that can change at any time.
+  # A new RUSTSEC entry would break CI on every branch even though no code
+  # changed, so this job is informational only (continue-on-error).
+  # A weekly cron workflow (rust-advisories.yaml) opens issues for new advisories.
+  lint-rust-advisories:
+    name: Lint Rust (advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check advisories (informational)
+        run: cargo deny --manifest-path crates/Cargo.toml check advisories
+
+  lint-python:
+    name: Lint Python
+    needs: [build-sdk, build-rust]
+    runs-on: ubuntu-latest-8-cores
+    timeout-minutes: 15
+    steps:
+      - name: Download SDK
+        uses: actions/download-artifact@v8
+        with:
+          name: CogPackage
+          path: dist
+      - name: Download coglet wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: CogletRustWheel
+          path: dist
+      - name: Extract source distribution
+        run: tar xf dist/*.tar.gz --strip-components=1
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Ensure nox is installed
+        run: mise install pipx:nox --force
+      - name: Lint Python
+        run: mise run lint:python
+
+  lint-docs:
+    name: Lint Markdown
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Lint Markdown
+        run: mise run lint:docs
+
+# =============================================================================
+# Test Jobs
+# =============================================================================
+
+  test-go:
+    name: "Test Go (${{ matrix.platform }})"
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Test Go
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -m  # job control, ensures script is in its own process group
+          cleanup() {
+            echo "::warning::Cancelling..."
+            kill -TERM -- -$$ 2>/dev/null || true
+            sleep 5
+            kill -KILL -- -$$ 2>/dev/null || true
+          }
+          trap cleanup INT TERM
+          gotestsum -- -short -timeout 1200s -parallel 5 ./... &
+          wait $!
+
+  fuzz-go:
+    name: Fuzz Go
+    runs-on: ubuntu-latest
+    # test:fuzz auto-discovers every Fuzz* target and runs each for FUZZTIME
+    # (30s default), so this scales as targets are added.
+    timeout-minutes: 15
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Fuzz all targets (auto-discovered)
+        run: mise run test:fuzz
+
+  test-rust:
+    name: Test Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Test Rust
+        run: mise run test:rust
+
+  test-python:
+    name: "Test Python ${{ matrix.python-version }}"
+    needs: [setup, build-sdk, build-rust]
+    runs-on: ubuntu-latest-8-cores
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.setup.outputs.supported_pythons) }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract source distribution
+        run: tar xf dist/*.tar.gz --strip-components=1
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Remove src to ensure tests run against wheel
+        run: rm -rf python/cog
+      - name: Test Python
+        run: uvx nox -s tests -p ${{ matrix.python-version }}
+
+  test-coglet-python:
+    name: "Test coglet-python (${{ matrix.python-version }})"
+    needs: [setup, build-rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.setup.outputs.supported_pythons) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Download coglet wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: CogletRustWheel
+          path: dist
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Test coglet-python bindings
+        run: uvx nox -s coglet -p ${{ matrix.python-version }}
+
+  # Compute integration test shards dynamically.
+  # Slow tests (tagged with [short] skip) are distributed round-robin first,
+  # then remaining tests fill in. This ensures slow tests don't pile up on one runner.
+  integration-shards:
+    name: Compute test shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.shard.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compute shards
+        id: shard
+        run: |
+          NUM_SHARDS=${{ env.NUM_IT_RUNNER_SHARDS }}
+          
+          # Find unconditionally skipped tests (bare "skip" without condition brackets)
+          # These are disabled tests that shouldn't affect shard distribution
+          SKIPPED_TESTS=$(grep -rl '^skip ' integration-tests/tests/*.txtar | \
+            xargs -I{} basename {} .txtar | sort || echo "")
+          
+          # Identify slow tests (have [short] skip marker), excluding unconditionally skipped
+          SLOW_TESTS=$(grep -rl '\[short\] skip' integration-tests/tests/*.txtar | \
+            xargs -I{} basename {} .txtar | sort)
+          if [ -n "$SKIPPED_TESTS" ]; then
+            SLOW_TESTS=$(comm -23 <(echo "$SLOW_TESTS") <(echo "$SKIPPED_TESTS"))
+          fi
+          
+          # All tests
+          ALL_TESTS=$(ls integration-tests/tests/*.txtar | \
+            xargs -I{} basename {} .txtar | sort)
+          
+          # Fast tests = all - slow (skipped tests end up here but run instantly)
+          FAST_TESTS=$(comm -23 <(echo "$ALL_TESTS") <(echo "$SLOW_TESTS"))
+          
+          # Distribute slow tests round-robin across shards
+          declare -a SHARDS
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
+            SHARDS[$i]=""
+          done
+          
+          idx=0
+          while IFS= read -r test; do
+            [ -z "$test" ] && continue
+            if [ -n "${SHARDS[$idx]}" ]; then
+              SHARDS[$idx]="${SHARDS[$idx]}|${test}"
+            else
+              SHARDS[$idx]="$test"
+            fi
+            idx=$(( (idx + 1) % NUM_SHARDS ))
+          done <<< "$SLOW_TESTS"
+          
+          # Distribute fast tests round-robin across shards
+          while IFS= read -r test; do
+            [ -z "$test" ] && continue
+            if [ -n "${SHARDS[$idx]}" ]; then
+              SHARDS[$idx]="${SHARDS[$idx]}|${test}"
+            else
+              SHARDS[$idx]="$test"
+            fi
+            idx=$(( (idx + 1) % NUM_SHARDS ))
+          done <<< "$FAST_TESTS"
+          
+          # Build JSON array of shard objects
+          JSON="["
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
+            PATTERN="${SHARDS[$i]}"
+            COUNT=$(echo "$PATTERN" | tr '|' '\n' | wc -l | tr -d ' ')
+            [ $i -gt 0 ] && JSON="${JSON},"
+            JSON="${JSON}{\"index\":$i,\"pattern\":\"${PATTERN}\",\"count\":$COUNT}"
+          done
+          JSON="${JSON}]"
+          
+          echo "shards=$JSON" >> "$GITHUB_OUTPUT"
+          
+          # Debug output
+          echo "Shard distribution:"
+          for i in $(seq 0 $((NUM_SHARDS - 1))); do
+            COUNT=$(echo "${SHARDS[$i]}" | tr '|' '\n' | wc -l | tr -d ' ')
+            SLOW_COUNT=$(echo "${SHARDS[$i]}" | tr '|' '\n' | while read t; do
+              echo "$SLOW_TESTS" | grep -q "^${t}$" && echo "$t"
+            done | wc -l | tr -d ' ')
+            echo "  Shard $i: $COUNT tests ($SLOW_COUNT slow)"
+          done
+
+  test-integration:
+    name: "Test integration (shard ${{ matrix.shard.index }})"
+    needs: [build-cog, build-sdk, build-rust, integration-shards]
+    runs-on: ubuntu-latest-16-cores
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.integration-shards.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+        with:
+          registry: index.docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Install cog binary
+        run: |
+          cp dist/cog ./cog
+          chmod +x ./cog
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Set wheel environment
+        run: |
+          # Use locally-built wheels, not PyPI (version may not be published yet)
+          # Must use absolute paths — cog subprocess runs from txtar workdir, not checkout root
+          echo "COG_SDK_WHEEL=${{ github.workspace }}/dist" >> $GITHUB_ENV
+          echo "COGLET_WHEEL=${{ github.workspace }}/dist" >> $GITHUB_ENV
+      - name: Run integration tests (shard ${{ matrix.shard.index }}, ${{ matrix.shard.count }} tests)
+        env:
+          COG_BINARY: ./cog
+          TEST_PARALLEL: 4
+          BUILDKIT_PROGRESS: 'quiet'
+          # Resolve cog-base images from GHCR instead of r8.im.
+          # Images are mirrored by integration-tests/mirror-cog-base-images.sh.
+          COG_REGISTRY_HOST: 'ghcr.io/replicate/cog'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -m  # job control, ensures script is in its own process group
+          cleanup() {
+            echo "::warning::Cancelling..."
+            kill -TERM -- -$$ 2>/dev/null || true
+            sleep 5
+            kill -KILL -- -$$ 2>/dev/null || true
+          }
+          trap cleanup INT TERM
+          
+          # Build an anchored -run regex from shard pattern "test1|test2|test3".
+          RUN_PATTERN="${{ matrix.shard.pattern }}"
+          echo "Running tests matching: $RUN_PATTERN"
+          
+          gotestsum --format github-actions -- \
+            -tags integration \
+            -parallel $TEST_PARALLEL \
+            -timeout 30m \
+            -run "^TestIntegration$/^($RUN_PATTERN)$" \
+            ./integration-tests/... &
+          wait $!
+
+# =============================================================================
+# Gate Job - Single required check for branch protection
+# =============================================================================
+
+  ci-complete:
+    name: CI Complete
+    needs:
+      - setup
+      - test-playground
+      - version-check
+      - build-cog
+      - build-sdk
+      - build-rust
+      - fmt-go
+      - fmt-rust
+      - fmt-python
+      - check-llm-docs
+      - check-stubs
+      - lint-go
+      - lint-rust
+      - lint-rust-deny
+      - lint-rust-advisories
+      - lint-python
+      - lint-docs
+      - test-go
+      - fuzz-go
+      - test-rust
+      - test-python
+      - test-coglet-python
+      - integration-shards
+      - test-integration
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        run: |
+          echo "Job results:"
+          echo "  test-playground: ${{ needs.test-playground.result }}"
+          echo "  version-check: ${{ needs.version-check.result }}"
+          echo "  build-cog: ${{ needs.build-cog.result }}"
+          echo "  build-sdk: ${{ needs.build-sdk.result }}"
+          echo "  build-rust: ${{ needs.build-rust.result }}"
+          echo "  fmt-go: ${{ needs.fmt-go.result }}"
+          echo "  fmt-rust: ${{ needs.fmt-rust.result }}"
+          echo "  fmt-python: ${{ needs.fmt-python.result }}"
+          echo "  check-llm-docs: ${{ needs.check-llm-docs.result }}"
+          echo "  check-stubs: ${{ needs.check-stubs.result }}"
+          echo "  lint-go: ${{ needs.lint-go.result }}"
+          echo "  lint-rust: ${{ needs.lint-rust.result }}"
+          echo "  lint-rust-deny: ${{ needs.lint-rust-deny.result }}"
+          echo "  lint-rust-advisories: ${{ needs.lint-rust-advisories.result }} (informational)"
+          echo "  lint-python: ${{ needs.lint-python.result }}"
+          echo "  lint-docs: ${{ needs.lint-docs.result }}"
+          echo "  test-go: ${{ needs.test-go.result }}"
+          echo "  fuzz-go: ${{ needs.fuzz-go.result }}"
+          echo "  test-rust: ${{ needs.test-rust.result }}"
+          echo "  test-python: ${{ needs.test-python.result }}"
+          echo "  test-coglet-python: ${{ needs.test-coglet-python.result }}"
+          echo "  integration-shards: ${{ needs.integration-shards.result }}"
+          echo "  test-integration: ${{ needs.test-integration.result }}"
+
+          # Fail if any required job failed. lint-rust-advisories is excluded:
+          # advisory DB updates shouldn't block unrelated PRs.
+          FAILED=false
+          for result in \
+            "${{ needs.setup.result }}" \
+            "${{ needs.version-check.result }}" \
+            "${{ needs.build-cog.result }}" \
+            "${{ needs.build-sdk.result }}" \
+            "${{ needs.build-rust.result }}" \
+            "${{ needs.fmt-go.result }}" \
+            "${{ needs.fmt-rust.result }}" \
+            "${{ needs.fmt-python.result }}" \
+            "${{ needs.check-llm-docs.result }}" \
+            "${{ needs.check-stubs.result }}" \
+            "${{ needs.lint-go.result }}" \
+            "${{ needs.lint-rust.result }}" \
+            "${{ needs.lint-rust-deny.result }}" \
+            "${{ needs.lint-python.result }}" \
+            "${{ needs.lint-docs.result }}" \
+            "${{ needs.test-go.result }}" \
+            "${{ needs.fuzz-go.result }}" \
+            "${{ needs.test-rust.result }}" \
+            "${{ needs.test-python.result }}" \
+            "${{ needs.test-coglet-python.result }}" \
+            "${{ needs.integration-shards.result }}" \
+            "${{ needs.test-integration.result }}"
+          do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              FAILED=true
+            fi
+          done
+
+          if [ "${{ needs.setup.outputs.playground_changed }}" = "true" ] && \
+             { [ "${{ needs.test-playground.result }}" = "failure" ] || [ "${{ needs.test-playground.result }}" = "cancelled" ]; }; then
+            FAILED=true
+          fi
+
+          if [ "$FAILED" = "true" ]; then
+            echo "::error::Some jobs failed or were cancelled"
+            exit 1
+          fi
+
+          echo "All CI checks passed!"
+
+# =============================================================================
+# Release Validation - Dry-run checks (PRs and main)
+# =============================================================================
+
+  release-dry-run:
+    name: Release Dry Run
+    needs: ci-complete
+    if: "!startsWith(github.ref, 'refs/tags/')"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2026.10.21
+          cache_key_prefix: mise-ci-${{ github.job }}
+      - name: Check coglet crates.io publish
+        run: cargo publish --dry-run -p coglet --manifest-path crates/Cargo.toml
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: check

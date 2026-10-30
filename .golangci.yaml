@@ -1,0 +1,93 @@
+version: "2"
+
+run:
+  timeout: 20m
+
+output:
+  # Show all issues, not just first few per linter
+  show-stats: true
+
+linters:
+  enable:
+    - copyloopvar
+    - errcheck
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - modernize
+    - revive
+    - staticcheck
+    - unconvert
+    - unused
+  settings:
+    errcheck:
+      disable-default-exclusions: false
+    gosec:
+      excludes:
+        - G301  # Expect directory permissions to be 0750 or less
+        - G302  # Expect file permissions to be 0600 or less  
+        - G304  # Potential file inclusion via variable
+        - G306  # Expect WriteFile permissions to be 0600 or less
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+        - name: exported
+          disabled: true
+        - name: var-naming
+          disabled: true
+    gocritic:
+      enabled-checks:
+        - appendCombine
+        - boolExprSimplify
+        - builtinShadow
+        - commentedOutCode
+        - commentedOutImport
+        - docStub
+        - emptyFallthrough
+        - equalFold
+        - hexLiteral
+        - indexAlloc
+        - initClause
+        - methodExprCall
+        - nilValReturn
+        - octalLiteral
+        - rangeExprCopy
+        - stringXbytes
+        - typeAssertChain
+        - typeUnparen
+        - unnecessaryBlock
+        - weakCond
+  exclusions:
+    generated: strict
+    rules:
+      # Exclude some linters from running on test files
+      - path: '(.+)_test\.go'
+        linters:
+          - errcheck
+          - gosec
+      # Exclude errcheck on defer cleanup patterns (can't handle error in defer)
+      - source: 'defer .+\.Close\(\)'
+        linters:
+          - errcheck
+      - source: 'defer os\.RemoveAll\('
+        linters:
+          - errcheck
+      # Exclude gosec G204 (command injection) - we intentionally run dynamic commands
+      - linters:
+          - gosec
+        text: 'G204:'
+      # ST1005: error strings should not be capitalized - too many to fix now
+      # TODO: Enable and fix these incrementally
+      - linters:
+          - staticcheck
+        text: 'ST1005:'
+      # modernize newexpr false positives: ptr(true) cannot be simplified to new(bool)
+      # because new(T) only produces zero-value pointers
+      - linters:
+          - modernize
+        text: 'newexpr:'

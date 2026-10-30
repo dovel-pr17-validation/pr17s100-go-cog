@@ -1,0 +1,213 @@
+package requirements
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"regexp"
+	"strings"
+)
+
+func ReadRequirements(path string) ([]string, error) {
+	re := regexp.MustCompile(`(?m)^\s*-e\s+\.\s*$`)
+
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+
+	// Use scanner to handle CRLF endings
+	scanner := bufio.NewScanner(fh)
+	scanner.Split(scanLinesWithContinuations)
+
+	var requirements []string
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comment lines
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if re.MatchString(line) {
+			continue
+		}
+
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+
+		if line != "" {
+			requirements = append(requirements, line)
+		}
+	}
+
+	return requirements, scanner.Err()
+}
+
+// scanLinesWithContinuations is a modified version of bufio.ScanLines that
+// also handles line continuations (lines ending with a backslash).
+func scanLinesWithContinuations(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	// If we're at EOF and there's no data, return nil
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+
+	var line []byte
+	start := 0
+	for i := range data {
+		if data[i] == '\n' {
+			end := i
+			if end > 0 && data[end-1] == '\r' {
+				end--
+			}
+			// Add this segment to our accumulated line
+			line = append(line, data[start:end]...)
+
+			if len(line) > 0 && line[len(line)-1] == '\\' {
+				// This is a continuation - remove the backslash and continue
+				line = line[:len(line)-1]
+				start = i + 1
+				continue
+			}
+
+			if len(line) == 0 {
+				continue
+			}
+
+			// Not a continuation, return the accumulated line
+			return i + 1, line, nil
+		}
+	}
+
+	// If we're at EOF, we have a final, non-terminated line
+	if atEOF {
+		if len(data) > start {
+			line = append(line, data[start:]...)
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+		}
+		return len(data), line, nil
+	}
+
+	// Need more data
+	return 0, nil, nil
+}
+
+// SplitPinnedPythonRequirement returns the name, version, findLinks, and extraIndexURLs from a requirements.txt line
+// in the form name==version [--find-links=<findLink>] [-f <findLink>] [--extra-index-url=<extraIndexURL>]
+func SplitPinnedPythonRequirement(requirement string) (name string, version string, findLinks []string, extraIndexURLs []string, err error) {
+	pinnedPackageRe := regexp.MustCompile(`(?:([a-zA-Z0-9\-_]+)==([^ ]+)|--find-links=([^\s]+)|-f\s+([^\s]+)|--extra-index-url=([^\s]+))`)
+
+	matches := pinnedPackageRe.FindAllStringSubmatch(requirement, -1)
+	if matches == nil {
+		return "", "", nil, nil, fmt.Errorf("Package %s is not in the expected format", requirement)
+	}
+
+	nameFound := false
+	versionFound := false
+
+	for _, match := range matches {
+		if match[1] != "" {
+			name = match[1]
+			nameFound = true
+		}
+
+		if match[2] != "" {
+			version = match[2]
+			versionFound = true
+		}
+
+		if match[3] != "" {
+			findLinks = append(findLinks, match[3])
+		}
+
+		if match[4] != "" {
+			findLinks = append(findLinks, match[4])
+		}
+
+		if match[5] != "" {
+			extraIndexURLs = append(extraIndexURLs, match[5])
+		}
+	}
+
+	if !nameFound || !versionFound {
+		return "", "", nil, nil, fmt.Errorf("Package name or version is missing in %s", requirement)
+	}
+
+	return name, version, findLinks, extraIndexURLs, nil
+}
+
+func PackageName(pipRequirement string) string {
+	re := regexp.MustCompile(`^([a-zA-Z0-9_\-\.]+(?:\[[^\]]+\])?)`)
+	match := re.FindStringSubmatch(pipRequirement)
+	if len(match) > 1 {
+		return match[1]
+	}
+	return ""
+}
+
+var nameSeparatorRe = regexp.MustCompile(`[-_.]+`)
+
+// NormalizePackageName canonicalizes a distribution name for comparison, PEP 503-style:
+// extras are dropped, "-_." separator runs collapse to "-", and the result is lowercased.
+func NormalizePackageName(name string) string {
+	name, _, _ = strings.Cut(name, "[")
+	return strings.ToLower(nameSeparatorRe.ReplaceAllString(name, "-"))
+}
+
+// versionSpecifierRe matches a single PEP 440 version specifier: an operator followed
+// by a version token. Used to distinguish an exact `==` pin from ranges and inequalities.
+var versionSpecifierRe = regexp.MustCompile(`(===|==|!=|~=|<=|>=|<|>)\s*([^\s,;|]+)`)
+
+// directURLRe matches a PEP 508 direct reference (e.g. "torch @ https://...").
+var directURLRe = regexp.MustCompile(`@\s*\S+`)
+
+// ExactVersion returns the version from a pip requirement only when it is a single exact
+// `==` pin, e.g. "torch==2.7.0" (inline pip options and the CUDA local tag are preserved).
+// Ranges, inequalities, wildcard pins, compound specifiers, direct URLs, and unpinned
+// requirements return ("", false): they do not name one concrete version to reason about.
+func ExactVersion(pipRequirement string) (string, bool) {
+	// Drop environment markers (";" and after); a marker's own comparators are not the pin.
+	if idx := strings.Index(pipRequirement, ";"); idx >= 0 {
+		pipRequirement = pipRequirement[:idx]
+	}
+	// A direct URL reference is never an exact version pin.
+	if directURLRe.MatchString(pipRequirement) {
+		return "", false
+	}
+	matches := versionSpecifierRe.FindAllStringSubmatch(pipRequirement, -1)
+	if len(matches) != 1 {
+		// Zero specifiers (unpinned) or more than one (a range like ">=2.0,<3.0").
+		return "", false
+	}
+	op, ver := matches[0][1], matches[0][2]
+	if op != "==" || strings.Contains(ver, "*") {
+		return "", false
+	}
+	return ver, true
+}
+
+func Versions(pipRequirement string) []string {
+	var versions []string
+
+	// Match standard specifier versions
+	reVersion := regexp.MustCompile(`[<>=!~]=?\s*([^\s,;|]+)`)
+	matches := reVersion.FindAllStringSubmatch(pipRequirement, -1)
+	for _, match := range matches {
+		if len(match) > 1 {
+			versions = append(versions, match[1])
+		}
+	}
+
+	// Match @ file/url version
+	reURL := regexp.MustCompile(`@\s*([^\s]+)`)
+	if match := reURL.FindStringSubmatch(pipRequirement); len(match) > 1 {
+		versions = append(versions, match[1])
+	}
+
+	return versions
+}

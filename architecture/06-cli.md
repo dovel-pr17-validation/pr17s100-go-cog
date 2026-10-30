@@ -1,0 +1,275 @@
+# CLI
+
+The Cog CLI is a Go binary that provides commands for the full model lifecycle: development, building, testing, and deployment. This document covers what each command does and how it connects to the systems described in previous docs.
+
+**Important**: Model code always runs inside a container, never on the host machine. Commands like `cog run` and `cog serve` build an image, start a container, and interact with it via the [Prediction API](./03-prediction-api.md). The CLI orchestrates this, but the model execution happens in the containerized [Container Runtime](./04-container-runtime.md).
+
+## Commands Overview
+
+| Command          | Job To Be Done                        |
+| ---------------- | ------------------------------------- |
+| `cog init`       | Bootstrap a new model project         |
+| `cog build`      | Create a container image              |
+| `cog run`        | Run a prediction in a container       |
+| `cog exec`       | Run arbitrary commands in a container |
+| `cog serve`      | Start HTTP server in a container      |
+| `cog playground` | Open a local UI for a model API       |
+| `cog push`       | Publish to an OCI registry            |
+| `cog login`      | Authenticate with Replicate           |
+
+## Development Commands
+
+### cog init
+
+**Job**: Create a starter `cog.yaml` and `run.py` for a new model.
+
+```bash
+cog init
+```
+
+Creates:
+
+- `cog.yaml` with sensible defaults
+- `run.py` with a skeleton Runner class
+
+**Code**: `pkg/cli/init.go`
+
+---
+
+### cog run
+
+**Job**: Run a prediction in a container.
+
+```bash
+cog run -i prompt="A photo of a cat" -i steps=50
+```
+
+What happens:
+
+1. Resolves the [Schema](./02-schema.md) from local source or an existing image label
+2. Parses, coerces, and validates `-i` flags when that schema is available
+3. Builds the image (for local source)
+4. Starts a container running the [Container Runtime](./04-container-runtime.md)
+5. Falls back to the runtime schema for older images without a usable schema label
+6. Sends a [PredictionRequest](./03-prediction-api.md) and streams output to the terminal
+
+Input types are inferred from the schema:
+
+- Strings: `-i prompt="hello"`
+- Numbers: `-i steps=50`
+- Files: `-i image=@photo.jpg` (uploaded to container)
+- URLs: `-i image=https://example.com/photo.jpg`
+
+**Code**: `pkg/cli/run.go` dispatches the public command; prediction execution is implemented in `pkg/cli/predict.go`.
+
+---
+
+### cog exec
+
+**Job**: Run arbitrary commands in a container.
+
+```bash
+cog exec python -c "import torch; print(torch.cuda.is_available())"
+cog exec bash
+```
+
+Builds the image (if needed), starts a container, and runs the specified command inside it. Useful for:
+
+- Debugging the container environment
+- Running one-off scripts
+- Interactive exploration
+
+**Code**: `pkg/cli/exec.go`
+
+---
+
+### cog serve
+
+**Job**: Start the HTTP server in a container for testing.
+
+```bash
+cog serve
+# Server running at http://localhost:5000
+```
+
+Builds the image (if needed) and starts a container running the [Container Runtime](./04-container-runtime.md). The container's port 5000 is exposed to the host. You can then:
+
+- Send requests to `POST /predictions`
+- View OpenAPI spec at `/openapi.json`
+- Check health at `/health-check`
+
+**Code**: `pkg/cli/serve.go`
+
+### cog playground
+
+**Job**: Explore and call a running Cog HTTP API from a browser.
+
+```bash
+cog serve -p 8393
+cog playground --target http://localhost:8393
+```
+
+The command serves an embedded browser-native application and reverse-proxies its requests to the selected model API. Each browser tab is an independent workspace: every request carries that tab's target, and the proxy keeps no shared current-target state, so tabs can use the same or different models concurrently. The UI and proxy accept only loopback connections, even when `--host 0.0.0.0` is used so a container can deliver webhooks. The proxy snapshots upstream response headers into encoded metadata so the request inspector can show model values without including or merging playground security and transport headers. Webhook URLs contain an opaque per-prediction token, which also isolates concurrent tab subscriptions, and payloads are relayed to the browser over server-sent events.
+
+The proxy is intentionally user-directed: this is a local development tool for APIs selected by the user, not a remotely hosted gateway. The TypeScript source and pnpm lockfile live in `playground/`; Vite bundles its deterministic output and license notices into `pkg/cli/playground/`, which Go embeds directly in every binary. Go builds, integration builds, and release builds consume the committed assets without installing or invoking Node. Browser dependencies are bundled from the lockfile, and AJV's dynamic schema compilation is confined to a worker with a narrower content security policy than the page.
+
+**Code**: `pkg/cli/` owns the server, proxy, and embedded generated application; `playground/` owns the TypeScript source and Vitest checks.
+
+## Build Commands
+
+### cog build
+
+**Job**: Build a container image from [Model Source](./01-model-source.md).
+
+```bash
+cog build -t my-model
+```
+
+What happens (see [Build System](./05-build-system.md) for details):
+
+1. **Parse** `cog.yaml`
+2. **Resolve** CUDA/cuDNN versions from compatibility matrix
+3. **Generate** the [Schema](./02-schema.md) statically from model source
+4. **Generate** Dockerfile
+5. **Build** image via Docker/Buildkit
+6. **Apply** labels (schema, config, pip freeze)
+
+Key flags:
+
+- `-t, --tag`: Image tag
+- `--no-cache`: Disable Docker cache
+- `--separate-weights`: Exclude weights from image (for separate upload)
+
+**Code**: `pkg/cli/build.go`, `pkg/image/build.go`
+
+## Deployment Commands
+
+### cog push
+
+**Job**: Build and publish an image or model bundle to an OCI registry.
+
+```bash
+cog push registry.example.com/username/model-name:v1
+```
+
+The `image` or `model` field in `cog.yaml` selects the artifact format. A positional target changes the destination without changing that format. Image projects publish one container image. Bundle projects publish an OCI image index containing the model image and any managed weight manifests.
+
+Pushes attempt to resolve the published artifacts to digest-pinned references, which the normal terminal output renders as a tree. `--json` makes digest resolution mandatory and emits one versioned document to stdout after the push and registry-provider post-processing succeed; progress and diagnostics remain on stderr. This lets automation consume immutable references without hiding a long-running push's live output.
+
+Registry-specific authentication, diagnostics, and post-push work sit behind the provider boundary. Replicate is one provider, not a requirement of the push path.
+
+**Code**: `pkg/cli/` owns the command and output contract; `pkg/model/` owns image and bundle publication; `pkg/registry/` and `pkg/provider/` own registry operations and provider-specific behavior.
+
+---
+
+### cog login
+
+**Job**: Authenticate with Replicate.
+
+```bash
+cog login
+# or
+cog login --token-stdin < token.txt
+```
+
+Stores credentials for `cog push`.
+
+**Code**: `pkg/cli/login.go`
+
+---
+
+### Hidden / Internal Commands
+
+These commands exist but are hidden from `cog --help`:
+
+- **`cog debug`** -- Generates the Dockerfile from cog.yaml without building (useful for debugging build issues)
+- **`cog weights`** -- Parent command for `weights build`, `weights push`, `weights inspect`
+
+There's also a separate `base-image` binary (`cmd/base-image/`) with subcommands for managing Cog base images (`dockerfile`, `build`, `generate-matrix`). This isn't a `cog` subcommand.
+
+## How CLI Commands Interact with Containers
+
+Local-source predictions generate and validate against the schema before building, then start a container and communicate over HTTP. Existing-image predictions use the image's schema label when available and otherwise fall back to the runtime schema after startup. `cog serve` builds and starts the same runtime without parsing prediction inputs. The CLI never runs model code directly.
+
+The local-source prediction flow is:
+
+```mermaid
+sequenceDiagram
+    participant CLI as cog CLI (host)
+    participant Docker
+    participant Container as Container (runtime)
+
+    CLI->>CLI: Load cog.yaml and generate schema
+    CLI->>CLI: Parse, coerce, and validate -i flags
+    CLI->>Docker: Build image (if needed)
+    Docker-->>CLI: Image ready
+
+    CLI->>Docker: Start container
+    Docker->>Container: python -m cog.server.http
+    Container->>Container: Run setup()
+
+    loop Until READY
+        CLI->>Container: GET /health-check
+        Container-->>CLI: Status (STARTING/READY)
+    end
+
+    CLI->>Container: POST /predictions
+    Container->>Container: Run run()
+    Container-->>CLI: Response JSON
+
+    CLI->>Docker: Stop container
+```
+
+For what happens inside the container (setup, predict, IPC), see [Container Runtime](./04-container-runtime.md).
+
+## CLI Architecture
+
+The CLI is built with [Cobra](https://github.com/spf13/cobra) (Go CLI framework).
+
+```
+cmd/cog/
+└── cog.go          # Entry point
+
+pkg/cli/
+├── root.go         # Root command, subcommand registration
+├── build.go        # cog build
+├── run.go          # cog run dispatch
+├── predict.go      # prediction execution and legacy cog predict
+├── exec.go         # cog exec
+├── serve.go        # cog serve
+├── playground.go   # cog playground and local proxy
+├── push.go         # cog push
+├── login.go        # cog login
+└── init.go         # cog init
+```
+
+Commands delegate to packages under `pkg/`:
+
+**Core:**
+
+- `pkg/cli/` -- Cobra command definitions
+- `pkg/config/` -- cog.yaml parsing and validation, compatibility matrices
+- `pkg/image/` -- Build orchestration (ties together config, Dockerfile generation, schema gen)
+- `pkg/dockerfile/` -- Dockerfile generation and base image selection
+- `pkg/docker/` -- Docker client operations
+- `pkg/predict/` -- Local prediction execution (talks to container's HTTP API)
+- `pkg/schema/` -- Static schema generator (tree-sitter)
+- `pkg/wheels/` -- SDK and coglet wheel resolution
+
+**Infrastructure:**
+
+- `pkg/web/` -- Replicate API client (for `cog push`)
+- `pkg/http/` -- Authenticated HTTP transport
+- `pkg/registry/` -- OCI/Docker registry client
+- `pkg/model/` -- OCI artifact domain model
+- `pkg/weights/` -- Weight file discovery and checksums
+- `pkg/errors/` -- `CodedError` for user-facing errors with error codes
+
+**Utilities:**
+
+- `pkg/dotcog/` -- `.cog/` project state directory (path accessors, advisory lock, cleanup)
+- `pkg/requirements/` -- `requirements.txt` parsing
+- `pkg/env/` -- `R8_*` environment variable config
+- `pkg/update/` -- CLI version update checker
+- `pkg/global/` -- Build-time metadata, process-wide config
+- `pkg/provider/` -- Abstracts registry-specific behavior for push workflows

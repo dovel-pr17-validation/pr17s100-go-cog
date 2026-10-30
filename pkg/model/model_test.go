@@ -1,0 +1,302 @@
+package model
+
+import (
+	"testing"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/stretchr/testify/require"
+
+	"github.com/replicate/cog/pkg/config"
+	"github.com/replicate/cog/pkg/weights/lockfile"
+)
+
+func TestModel_HasGPU(t *testing.T) {
+	tests := []struct {
+		name   string
+		model  *Model
+		expect bool
+	}{
+		{
+			name:   "nil config",
+			model:  &Model{Config: nil},
+			expect: false,
+		},
+		{
+			name:   "nil build",
+			model:  &Model{Config: &config.Config{Build: nil}},
+			expect: false,
+		},
+		{
+			name:   "GPU false",
+			model:  &Model{Config: &config.Config{Build: &config.Build{GPU: false}}},
+			expect: false,
+		},
+		{
+			name:   "GPU true",
+			model:  &Model{Config: &config.Config{Build: &config.Build{GPU: true}}},
+			expect: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.model.HasGPU()
+			require.Equal(t, tt.expect, result)
+		})
+	}
+}
+
+func TestModel_SchemaJSON(t *testing.T) {
+	tests := []struct {
+		name       string
+		model      *Model
+		expectNil  bool
+		expectJSON string
+	}{
+		{
+			name:      "nil schema",
+			model:     &Model{Schema: nil},
+			expectNil: true,
+		},
+		{
+			name: "schema with openapi version",
+			model: &Model{
+				Schema: &openapi3.T{
+					OpenAPI: "3.0.0",
+				},
+			},
+			expectNil: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tt.model.SchemaJSON()
+			require.NoError(t, err)
+			if tt.expectNil {
+				require.Nil(t, result)
+			} else {
+				require.NotNil(t, result)
+				// Verify it's valid JSON containing expected field
+				require.Contains(t, string(result), `"openapi"`)
+			}
+		})
+	}
+}
+
+func TestModel_ImageRef(t *testing.T) {
+	tests := []struct {
+		name   string
+		model  *Model
+		expect string
+	}{
+		{
+			name:   "nil image",
+			model:  &Model{Image: nil},
+			expect: "",
+		},
+		{
+			name: "with image reference",
+			model: &Model{
+				Image: &ImageArtifact{Reference: "r8.im/user/model@sha256:abc123"},
+			},
+			expect: "r8.im/user/model@sha256:abc123",
+		},
+		{
+			name: "with empty reference",
+			model: &Model{
+				Image: &ImageArtifact{Reference: ""},
+			},
+			expect: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.model.ImageRef()
+			require.Equal(t, tt.expect, result)
+		})
+	}
+}
+
+func TestModel_GetImageArtifact(t *testing.T) {
+	imgArtifact := NewImageArtifact("model",
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "abc123"}, Size: 1024},
+		"r8.im/user/model@sha256:abc123",
+	)
+	weightArtifact := newWeightArtifact(
+		lockfile.WeightLockEntry{Name: "weights", Target: "/src/weights"},
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "def456"}, Size: 4096},
+		[]packedLayer{{Digest: v1.Hash{Algorithm: "sha256", Hex: "aaa"}, Size: 100, MediaType: mediaTypeOCILayerTarGzip}},
+	)
+
+	tests := []struct {
+		name      string
+		model     *Model
+		expectNil bool
+	}{
+		{
+			name:      "no artifacts",
+			model:     &Model{},
+			expectNil: true,
+		},
+		{
+			name:      "nil artifacts",
+			model:     &Model{Artifacts: nil},
+			expectNil: true,
+		},
+		{
+			name:      "only weight artifacts",
+			model:     &Model{Artifacts: []Artifact{weightArtifact}},
+			expectNil: true,
+		},
+		{
+			name:      "has image artifact",
+			model:     &Model{Artifacts: []Artifact{imgArtifact, weightArtifact}},
+			expectNil: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.model.GetImageArtifact()
+			if tt.expectNil {
+				require.Nil(t, result)
+			} else {
+				require.NotNil(t, result)
+				require.Equal(t, ArtifactTypeImage, result.Type())
+				require.Equal(t, "model", result.Name())
+			}
+		})
+	}
+}
+
+func TestModel_WeightArtifacts(t *testing.T) {
+	imgArtifact := NewImageArtifact("model",
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "abc123"}, Size: 1024},
+		"r8.im/user/model@sha256:abc123",
+	)
+	w1 := newWeightArtifact(
+		lockfile.WeightLockEntry{Name: "llama", Target: "/src/weights/llama"},
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "w1"}, Size: 4096},
+		[]packedLayer{{Digest: v1.Hash{Algorithm: "sha256", Hex: "aaa"}, Size: 100, MediaType: mediaTypeOCILayerTar}},
+	)
+	w2 := newWeightArtifact(
+		lockfile.WeightLockEntry{Name: "embeddings", Target: "/src/weights/embed"},
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "w2"}, Size: 2048},
+		[]packedLayer{{Digest: v1.Hash{Algorithm: "sha256", Hex: "bbb"}, Size: 100, MediaType: mediaTypeOCILayerTar}},
+	)
+
+	tests := []struct {
+		name   string
+		model  *Model
+		expect int
+	}{
+		{name: "no artifacts", model: &Model{}, expect: 0},
+		{name: "only image", model: &Model{Artifacts: []Artifact{imgArtifact}}, expect: 0},
+		{name: "one weight", model: &Model{Artifacts: []Artifact{imgArtifact, w1}}, expect: 1},
+		{name: "two weights", model: &Model{Artifacts: []Artifact{imgArtifact, w1, w2}}, expect: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.model.WeightArtifacts()
+			require.Len(t, result, tt.expect)
+		})
+	}
+}
+
+func TestModel_ArtifactsByType(t *testing.T) {
+	imgArtifact := NewImageArtifact("model",
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "abc123"}, Size: 1024},
+		"r8.im/user/model@sha256:abc123",
+	)
+	w1 := newWeightArtifact(
+		lockfile.WeightLockEntry{Name: "llama", Target: "/src/weights/llama"},
+		v1.Descriptor{Digest: v1.Hash{Algorithm: "sha256", Hex: "w1"}, Size: 4096},
+		[]packedLayer{{Digest: v1.Hash{Algorithm: "sha256", Hex: "aaa"}, Size: 100, MediaType: mediaTypeOCILayerTar}},
+	)
+
+	m := &Model{Artifacts: []Artifact{imgArtifact, w1}}
+
+	images := m.ArtifactsByType(ArtifactTypeImage)
+	require.Len(t, images, 1)
+	require.Equal(t, "model", images[0].Name())
+
+	weights := m.ArtifactsByType(ArtifactTypeWeight)
+	require.Len(t, weights, 1)
+	require.Equal(t, "llama", weights[0].Name())
+}
+
+func TestModel_IsBundle(t *testing.T) {
+	t.Run("returns false for zero-value model", func(t *testing.T) {
+		m := &Model{}
+		require.False(t, m.IsBundle())
+	})
+
+	t.Run("returns false for FormatImage", func(t *testing.T) {
+		m := &Model{
+			Format: FormatImage,
+			Artifacts: []Artifact{
+				&ImageArtifact{name: "model", Reference: "r8.im/user/model:latest"},
+			},
+		}
+		require.False(t, m.IsBundle())
+	})
+
+	t.Run("returns true for FormatBundle with weights", func(t *testing.T) {
+		m := &Model{
+			Format: FormatBundle,
+			Artifacts: []Artifact{
+				&ImageArtifact{name: "model", Reference: "r8.im/user/model:latest"},
+			},
+			Weights: []Weight{
+				{Name: "w1", Target: "/src/weights/w1", SetDigest: "sha256:abc123"},
+			},
+		}
+		require.True(t, m.IsBundle())
+	})
+
+	t.Run("returns true for FormatBundle with no weights", func(t *testing.T) {
+		// FormatBundle is now driven by Format, not by weight count — a
+		// model with model: in cog.yaml but no managed weights still
+		// produces a bundle (an OCI index containing only the image).
+		m := &Model{
+			Format: FormatBundle,
+			Artifacts: []Artifact{
+				&ImageArtifact{name: "model", Reference: "r8.im/user/model:latest"},
+			},
+		}
+		require.True(t, m.IsBundle())
+	})
+
+	t.Run("ignores weights when Format is FormatImage", func(t *testing.T) {
+		// Format is the single source of truth. Weights alone do not
+		// promote a model to FormatBundle.
+		m := &Model{
+			Format: FormatImage,
+			Weights: []Weight{
+				{Name: "w1", Target: "/src/weights/w1", SetDigest: "sha256:abc123"},
+			},
+		}
+		require.False(t, m.IsBundle())
+	})
+}
+
+func TestFormat_String(t *testing.T) {
+	tests := []struct {
+		format Format
+		want   string
+	}{
+		{FormatImage, "image"},
+		{FormatBundle, "bundle"},
+		{Format(0), "unknown"},
+		{Format(99), "unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			require.Equal(t, tt.want, tt.format.String())
+		})
+	}
+}

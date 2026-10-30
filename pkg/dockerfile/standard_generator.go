@@ -1,0 +1,1335 @@
+package dockerfile
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/replicate/cog/pkg/config"
+	"github.com/replicate/cog/pkg/docker/command"
+	"github.com/replicate/cog/pkg/registry"
+	"github.com/replicate/cog/pkg/requirements"
+	"github.com/replicate/cog/pkg/util/console"
+	"github.com/replicate/cog/pkg/util/version"
+	"github.com/replicate/cog/pkg/weightslegacy"
+	"github.com/replicate/cog/pkg/wheels"
+)
+
+const LDConfigCacheBuildCommand = "RUN find / -type f -name \"*python*.so\" -printf \"%h\\n\" | sort -u > /etc/ld.so.conf.d/cog.conf && ldconfig"
+const StripDebugSymbolsCommand = "find / -type f -name \"*python*.so\" -not -name \"*cpython*.so\" -exec strip -S {} \\;"
+const CFlags = "ENV CFLAGS=\"-O3 -funroll-loops -fno-strict-aliasing -flto -S\""
+const UVVersion = "0.9.26"
+const uvCacheMount = "--mount=type=cache,target=/root/.cache/uv"
+const uvPip = "uv pip"
+const observabilityConfigBuildPath = "telemetry.py"
+const observabilityConfigRuntimePath = "/.cog/telemetry.py"
+const PythonTracingRequirements = "opentelemetry-exporter-otlp-proto-http==1.44.0 opentelemetry-exporter-otlp-proto-grpc==1.44.0"
+const uvBreakSystemPackages = "--break-system-packages"
+const PrecompilePythonCommand = "RUN find / -type f -name \"*.py[co]\" -delete && find / -type f -name \"*.py\" -exec touch -t 197001010000 {} \\; && find / -type f -name \"*.py\" -printf \"%h\\n\" | sort -u | /usr/bin/python3 -m compileall --invalidation-mode timestamp -o 2 -j 0"
+const STANDARD_GENERATOR_NAME = "STANDARD_GENERATOR"
+
+// localArtifactsDir is the directory local package artifacts are staged into,
+// both under the build context on the host and under /tmp in the container.
+const localArtifactsDir = "local_package_artifacts"
+const localArtifactsContainerDir = "/tmp/" + localArtifactsDir
+
+type StandardGenerator struct {
+	Config         *config.Config
+	Dir            string
+	ConfigFilename string // Base filename like "cog.yaml" or "my-config.yaml"
+
+	// these are here to make this type testable
+	GOOS   string
+	GOARCH string
+
+	useCudaBaseImage bool
+	useCogBaseImage  *bool
+	strip            bool
+	precompile       bool
+
+	// absolute path to the build cache dir (.cog/build/)
+	tmpDir        string
+	buildRootInfo os.FileInfo
+	buildRoot     *os.Root
+
+	fileWalker weightslegacy.FileWalker
+
+	modelDirs  []string
+	modelFiles []string
+
+	pythonRequirementsContents string
+	command                    command.Command
+	client                     registry.Client
+	requiresCog                bool
+	breakSystemPackages        bool
+
+	// Optional overrides for wheel configs (used by tests for deterministic output).
+	// When nil, auto-detection is used (env var → dist/ → PyPI).
+	cogWheelConfig    *wheels.WheelConfig
+	cogletWheelConfig *wheels.WheelConfig
+
+	// Resolved wheel configs — set once by resolveCogWheelConfigs() and shared
+	// between filterManagedPackages() (for warnings) and installCog() (for install).
+	resolvedCogConfig    *wheels.WheelConfig
+	resolvedCogletConfig *wheels.WheelConfig
+}
+
+func NewStandardGenerator(config *config.Config, dir string, buildCacheDir string, configFilename string, command command.Command, client registry.Client, requiresCog bool) (*StandardGenerator, error) {
+	// Default to "cog.yaml" if not specified
+	if configFilename == "" {
+		configFilename = "cog.yaml"
+	}
+	if err := config.ResolveLocalPackageArtifacts(dir); err != nil {
+		return nil, err
+	}
+	buildRootInfo, err := os.Lstat(buildCacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect build directory: %w", err)
+	}
+	if !buildRootInfo.IsDir() {
+		return nil, fmt.Errorf("build path %s must be a directory", buildCacheDir)
+	}
+
+	return &StandardGenerator{
+		Config:         config,
+		Dir:            dir,
+		ConfigFilename: configFilename,
+		// Docker build target is always linux/amd64 (see pkg/docker/buildkit.go).
+		// These must match the container platform, not the host.
+		GOOS:             "linux",
+		GOARCH:           "amd64",
+		tmpDir:           buildCacheDir,
+		buildRootInfo:    buildRootInfo,
+		fileWalker:       filepath.Walk,
+		useCudaBaseImage: true,
+		useCogBaseImage:  nil,
+		strip:            false,
+		precompile:       false,
+		command:          command,
+		client:           client,
+		requiresCog:      requiresCog,
+	}, nil
+}
+
+func (g *StandardGenerator) SetUseCudaBaseImage(argumentValue string) {
+	// "false" -> false, "true" -> true, "auto" -> true, "asdf" -> true
+	g.useCudaBaseImage = argumentValue != "false"
+}
+
+func (g *StandardGenerator) SetUseCogBaseImage(useCogBaseImage bool) {
+	g.useCogBaseImage = new(bool)
+	*g.useCogBaseImage = useCogBaseImage
+}
+
+func (g *StandardGenerator) SetUseCogBaseImagePtr(useCogBaseImage *bool) {
+	g.useCogBaseImage = useCogBaseImage
+}
+
+func (g *StandardGenerator) IsUsingCogBaseImage() bool {
+	useCogBaseImage := g.useCogBaseImage
+	if useCogBaseImage != nil {
+		return *useCogBaseImage
+	}
+	return true
+}
+
+func (g *StandardGenerator) SetStrip(strip bool) {
+	g.strip = strip
+}
+
+func (g *StandardGenerator) SetPrecompile(precompile bool) {
+	g.precompile = precompile
+}
+
+func (g *StandardGenerator) SetBreakSystemPackages(breakSystemPackages bool) {
+	g.breakSystemPackages = breakSystemPackages
+}
+
+// needsBreakSystemPackages reports whether pip invocations need
+// --break-system-packages. True when the caller opts in explicitly, the
+// generated Dockerfile installs Python via uv, or a CUDA 13+ Cog base supplies
+// uv-managed Python. uv marks its installed Pythons as externally managed
+// (PEP 668).
+func (g *StandardGenerator) needsBreakSystemPackages() bool {
+	return g.breakSystemPackages ||
+		(g.Config.Build.GPU && g.useCudaBaseImage && !g.IsUsingCogBaseImage()) ||
+		(g.IsUsingCogBaseImage() && version.GreaterOrEqual(g.Config.Build.CUDA, "13.0"))
+}
+
+func (g *StandardGenerator) uvPipInstallFlags(flags string) string {
+	if g.needsBreakSystemPackages() {
+		return uvBreakSystemPackages + " " + flags
+	}
+	return flags
+}
+
+func (g *StandardGenerator) GenerateInitialSteps(ctx context.Context) (string, error) {
+	if err := g.openBuildRoot(); err != nil {
+		return "", err
+	}
+	defer g.closeBuildRoot()
+
+	baseImage, err := g.BaseImage(ctx)
+	if err != nil {
+		return "", err
+	}
+	installPython, err := g.installPython()
+	if err != nil {
+		return "", err
+	}
+	aptInstalls, err := g.aptInstalls()
+	if err != nil {
+		return "", err
+	}
+	envs, err := g.envVars()
+	if err != nil {
+		return "", err
+	}
+	runCommands, err := g.runCommands()
+	if err != nil {
+		return "", err
+	}
+	pipInstalls, err := g.pipInstalls()
+	if err != nil {
+		return "", err
+	}
+	installCog, err := g.installCog()
+	if err != nil {
+		return "", err
+	}
+	installCACert, err := g.installCACert()
+	if err != nil {
+		return "", err
+	}
+
+	if g.IsUsingCogBaseImage() {
+		steps := []string{
+			"#syntax=docker/dockerfile:1.4",
+			"FROM " + baseImage,
+			installCACert, // First! Before any network requests (apt, pip, etc.)
+			envs,
+			aptInstalls,
+			g.installUV(),
+			g.installPythonAlias(),
+		}
+		// Install user packages before the SDK so that changing the SDK
+		// wheel (e.g. via --cog-ref or COG_SDK_WHEEL) does not invalidate
+		// the Docker cache for expensive user dependencies like torch.
+		// This matches the non-cog-base-image path ordering below.
+		steps = append(steps, pipInstalls)
+		if installCog != "" {
+			steps = append(steps, installCog)
+		}
+		if g.precompile {
+			steps = append(steps, PrecompilePythonCommand)
+		}
+		steps = append(steps, runCommands)
+
+		return joinStringsWithoutLineSpace(steps), nil
+	}
+
+	// For the CUDA path, uv is installed inside installPython (after the apt step).
+	// For all other paths (python:X-slim), install uv after apt.
+	uvInstall := ""
+	if installPython == "" {
+		uvInstall = g.installUV()
+	}
+	steps := []string{
+		"#syntax=docker/dockerfile:1.4",
+		"FROM " + baseImage,
+		g.preamble(),
+		installCACert, // Early! Before tini (uses curl), apt, pip, etc.
+		g.installTini(),
+		envs,
+		aptInstalls,
+		uvInstall,
+		installPython,
+		pipInstalls,
+		installCog,
+	}
+	if g.precompile {
+		steps = append(steps, PrecompilePythonCommand)
+	}
+	steps = append(steps, LDConfigCacheBuildCommand, runCommands)
+
+	return joinStringsWithoutLineSpace(steps), nil
+}
+
+func (g *StandardGenerator) openBuildRoot() error {
+	root, err := os.OpenRoot(g.tmpDir)
+	if err != nil {
+		return fmt.Errorf("failed to open build directory: %w", err)
+	}
+	info, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return fmt.Errorf("failed to inspect build directory: %w", err)
+	}
+	if !os.SameFile(g.buildRootInfo, info) {
+		_ = root.Close()
+		return fmt.Errorf("build directory changed during Dockerfile generation")
+	}
+	g.buildRoot = root
+	return nil
+}
+
+func (g *StandardGenerator) closeBuildRoot() {
+	if g.buildRoot != nil {
+		_ = g.buildRoot.Close()
+		g.buildRoot = nil
+	}
+}
+
+func (g *StandardGenerator) GenerateModelBase(ctx context.Context) (string, error) {
+	initialSteps, err := g.GenerateInitialSteps(ctx)
+	if err != nil {
+		return "", err
+	}
+	steps := []string{
+		initialSteps,
+		`WORKDIR /src`,
+		`EXPOSE 5000`,
+	}
+	if step := g.observabilityConfigCopy(); step != "" {
+		steps = append(steps, step)
+	}
+	steps = append(steps, g.cogEnvVars()...)
+	steps = append(steps, `CMD ["python", "-m", "cog.server.http"]`)
+	return strings.Join(steps, "\n"), nil
+}
+
+// GenerateDockerfileWithoutSeparateWeights generates a Dockerfile that doesn't write model weights to a separate layer.
+func (g *StandardGenerator) GenerateDockerfileWithoutSeparateWeights(ctx context.Context) (string, error) {
+	base, err := g.GenerateModelBase(ctx)
+	if err != nil {
+		return "", err
+	}
+	bases := []string{
+		base,
+		`COPY . /src`,
+	}
+	if m := g.cpCogYaml(); m != "" {
+		bases = append(bases, m)
+	}
+	return joinStringsWithoutLineSpace(bases), nil
+}
+
+// GenerateModelBaseWithSeparateWeights creates a weights Dockerfile (FROM scratch + COPY),
+// a runner Dockerfile (full image minus weight files), and a list of exclude patterns
+// for the runner build context (so weight files aren't sent twice).
+func (g *StandardGenerator) GenerateModelBaseWithSeparateWeights(ctx context.Context, imageName string) (weightsBase string, dockerfile string, weightsExcludePatterns []string, err error) {
+	weightsBase, g.modelDirs, g.modelFiles, err = g.generateForWeights()
+	if err != nil {
+		return "", "", nil, fmt.Errorf("Failed to generate Dockerfile for model weights files: %w", err)
+	}
+	initialSteps, err := g.GenerateInitialSteps(ctx)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	// Inject weights base image into initial steps so we can COPY from it
+	base := []string{}
+	initialStepsLines := strings.Split(initialSteps, "\n")
+	for i, line := range initialStepsLines {
+		if strings.HasPrefix(line, "FROM ") {
+			base = append(base, fmt.Sprintf("FROM %s AS %s", imageName+"-weights", "weights"))
+			base = append(base, initialStepsLines[i:]...)
+			break
+		} else {
+			base = append(base, line)
+		}
+	}
+
+	for _, p := range append(g.modelDirs, g.modelFiles...) {
+		base = append(base, "COPY --from=weights --link "+path.Join("/src", p)+" "+path.Join("/src", p))
+	}
+
+	base = append(base,
+		`WORKDIR /src`,
+		`EXPOSE 5000`,
+	)
+	if step := g.observabilityConfigCopy(); step != "" {
+		base = append(base, step)
+	}
+	base = append(base, g.cogEnvVars()...)
+	base = append(base,
+		`CMD ["python", "-m", "cog.server.http"]`,
+		`COPY . /src`,
+	)
+	if m := g.cpCogYaml(); m != "" {
+		base = append(base, m)
+	}
+
+	for _, d := range g.modelDirs {
+		weightsExcludePatterns = append(weightsExcludePatterns, d, d+"/**/*")
+	}
+	weightsExcludePatterns = append(weightsExcludePatterns, g.modelFiles...)
+
+	return weightsBase, joinStringsWithoutLineSpace(base), weightsExcludePatterns, nil
+}
+
+// cogEnvVars returns ENV lines that pass cog.yaml config to the runtime
+// so the container doesn't need to parse cog.yaml at startup.
+func (g *StandardGenerator) cogEnvVars() []string {
+	var envs []string
+	if g.Config.Predict != "" {
+		envs = append(envs, fmt.Sprintf(`ENV COG_PREDICT_TYPE_STUB="%s"`, g.Config.Predict))
+	}
+	if g.Config.Train != "" {
+		envs = append(envs, fmt.Sprintf(`ENV COG_TRAIN_TYPE_STUB="%s"`, g.Config.Train))
+	}
+	if g.Config.Concurrency != nil && g.Config.Concurrency.Max > 0 {
+		envs = append(envs, fmt.Sprintf(`ENV COG_MAX_CONCURRENCY=%d`, g.Config.Concurrency.Max))
+	}
+	if g.Config.Observability != nil && g.Config.Observability.Traces != nil && g.Config.Observability.Traces.Enabled {
+		traces := g.Config.Observability.Traces
+		envs = append(envs,
+			`ENV COG_TRACE_CONFIGURED=true`,
+			`ENV COG_TRACE_ENABLED=true`,
+			fmt.Sprintf(`ENV COG_TRACE_SAMPLER="%s"`, traces.Sampler),
+		)
+		if traces.SamplerArg != "" {
+			envs = append(envs, fmt.Sprintf(`ENV COG_TRACE_SAMPLER_ARG="%s"`, traces.SamplerArg))
+		}
+		if traces.TraceHeader != "" {
+			envs = append(envs,
+				fmt.Sprintf(`ENV COG_TRACE_HEADER="%s"`, traces.TraceHeader),
+				fmt.Sprintf(`ENV COG_TRACE_HEADER_FORMAT="%s"`, traces.TraceHeaderFormat),
+			)
+		}
+		if g.Config.Observability.Config != "" {
+			envs = append(envs, `ENV COG_OBSERVABILITY_CONFIG="`+observabilityConfigRuntimePath+`"`)
+		}
+	}
+	return envs
+}
+
+func (g *StandardGenerator) observabilityConfigCopy() string {
+	if g.Config.Observability == nil || g.Config.Observability.Traces == nil || !g.Config.Observability.Traces.Enabled || g.Config.Observability.Config == "" {
+		return ""
+	}
+	return "COPY --from=cog_build " + observabilityConfigBuildPath + " " + observabilityConfigRuntimePath
+}
+
+func (g *StandardGenerator) cpCogYaml() string {
+	if g.ConfigFilename == "" || g.ConfigFilename == "cog.yaml" {
+		return ""
+	}
+	// Absolute filename doesn't work anyway, so it's always relative
+	return fmt.Sprintf("RUN cp %s /src/cog.yaml", filepath.Join("/src", g.ConfigFilename))
+}
+
+func (g *StandardGenerator) generateForWeights() (string, []string, []string, error) {
+	modelDirs, modelFiles, err := weightslegacy.FindWeights(g.fileWalker)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	// generate dockerfile to store these model weights files
+	var dockerfileContents strings.Builder
+	dockerfileContents.WriteString(`#syntax=docker/dockerfile:1.4
+FROM scratch
+`)
+	for _, p := range append(modelDirs, modelFiles...) {
+		fmt.Fprintf(&dockerfileContents, "\nCOPY %s %s", p, path.Join("/src", p))
+	}
+
+	return dockerfileContents.String(), modelDirs, modelFiles, nil
+}
+
+func (g *StandardGenerator) BaseImage(ctx context.Context) (string, error) {
+	if g.IsUsingCogBaseImage() {
+		baseImage, err := g.determineBaseImageName(ctx)
+		if err == nil || g.useCogBaseImage != nil {
+			return baseImage, err
+		}
+		console.Warnf("Could not find a suitable base image, continuing without base image support (%v).", err)
+		if g.useCogBaseImage == nil {
+			g.useCogBaseImage = new(bool)
+			*g.useCogBaseImage = false
+		}
+	}
+
+	if g.Config.Build.GPU && g.useCudaBaseImage {
+		return g.Config.CUDABaseImageTag()
+	}
+	return "python:" + g.Config.Build.PythonVersion + "-slim", nil
+}
+
+func (g *StandardGenerator) Name() string {
+	return STANDARD_GENERATOR_NAME
+}
+
+// BuildDir returns the Docker build context directory (the project root).
+// The context is filtered at the BuildKit session level to exclude .cog/,
+// so this just returns "." — the actual filtering happens in buildkit.go
+// via ExcludePatterns.
+func (g *StandardGenerator) BuildDir() (string, error) {
+	return ".", nil
+}
+
+// BuildCacheDir returns the absolute path to .cog/build/ where all build
+// staging artifacts live (Dockerfile, wheels, requirements.txt, schemas,
+// weights manifest, CA certs).
+func (g *StandardGenerator) BuildCacheDir() string {
+	return g.tmpDir
+}
+
+// BuildContexts returns named build contexts passed to BuildKit. The
+// "cog_build" context points at .cog/build/ and is referenced by
+// COPY --from=cog_build instructions in the generated Dockerfile.
+func (g *StandardGenerator) BuildContexts() (map[string]string, error) {
+	return map[string]string{
+		"cog_build": g.tmpDir,
+	}, nil
+}
+
+func (g *StandardGenerator) preamble() string {
+	return `ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/nvidia/bin
+ENV NVIDIA_DRIVER_CAPABILITIES=all`
+}
+
+func (g *StandardGenerator) installTini() string {
+	// Install tini as the image entrypoint to provide signal handling and process
+	// reaping appropriate for PID 1.
+	//
+	// N.B. If you remove/change this, consider removing/changing the `has_init`
+	// image label applied in image/build.go.
+	lines := []string{
+		`RUN --mount=type=cache,target=/var/cache/apt,sharing=locked set -eux; \
+apt-get update -qq && \
+apt-get install -qqy --no-install-recommends curl; \
+rm -rf /var/lib/apt/lists/*; \
+TINI_VERSION=v0.19.0; \
+TINI_ARCH="$(dpkg --print-architecture)"; \
+curl -sSL -o /sbin/tini "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini-${TINI_ARCH}"; \
+chmod +x /sbin/tini`,
+		`ENTRYPOINT ["/sbin/tini", "--"]`,
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (g *StandardGenerator) aptInstalls() (string, error) {
+	packages := g.Config.Build.SystemPackages
+	if len(packages) == 0 {
+		return "", nil
+	}
+
+	if g.IsUsingCogBaseImage() {
+		// Filter out packages that are already in the base image
+		packages = slices.DeleteFunc(slices.Clone(packages), func(pkg string) bool {
+			return slices.Contains(baseImageSystemPackages, pkg)
+		})
+	}
+
+	return "RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update -qq && apt-get install -qqy " +
+		strings.Join(packages, " ") +
+		" && rm -rf /var/lib/apt/lists/*", nil
+}
+
+func (g *StandardGenerator) installPython() (string, error) {
+	if g.Config.Build.GPU && g.useCudaBaseImage && !g.IsUsingCogBaseImage() {
+		return g.installPythonCUDA()
+	}
+	return "", nil
+}
+
+func (g *StandardGenerator) installPythonAlias() string {
+	if g.IsUsingCogBaseImage() && version.GreaterOrEqual(g.Config.Build.CUDA, "13.0") {
+		return `RUN ln -sf /usr/bin/python3 /usr/local/bin/python`
+	}
+	return ""
+}
+
+func (g *StandardGenerator) installUV() string {
+	return `COPY --from=ghcr.io/astral-sh/uv:` + UVVersion + ` /uv /uvx /usr/local/bin/
+ENV UV_SYSTEM_PYTHON=true`
+}
+
+func (g *StandardGenerator) installPythonCUDA() (string, error) {
+	// TODO: check that python version is valid
+
+	py := g.Config.Build.PythonVersion
+	return `RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update -qq && apt-get install -qqy --no-install-recommends \
+	wget \
+	curl \
+	xz-utils \
+	git \
+	ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+` + g.installUV() + "\n" + fmt.Sprintf(`RUN uv python install %s && \
+	ln -sf $(uv python find %s) /usr/bin/python3 && \
+	ln -sf $(uv python find %s) /usr/local/bin/python
+ENV UV_PYTHON=%s
+ENV PATH="/usr/local/bin:$PATH"`, py, py, py, py), nil
+}
+
+// resolveCogWheelConfigs resolves and caches the cog and coglet wheel configs.
+// It is idempotent — subsequent calls are no-ops. Must be called before
+// filterManagedPackages() and installCog().
+//
+// Precedence for cog SDK:
+//  1. Test override (cogWheelConfig field)
+//  2. COG_SDK_WHEEL env var
+//  3. build.sdk_version in cog.yaml
+//  4. Auto-detect dist/ (dev builds only)
+//  5. Latest PyPI
+//
+// Precedence for coglet:
+//  1. Test override (cogletWheelConfig field)
+//  2. COGLET_WHEEL env var
+//  3. Auto-detect dist/ (dev builds only)
+//  4. Latest PyPI
+func (g *StandardGenerator) resolveCogWheelConfigs() error {
+	if g.resolvedCogConfig != nil {
+		return nil // already resolved
+	}
+
+	var err error
+
+	// Resolve cog SDK
+	if g.cogWheelConfig != nil {
+		g.resolvedCogConfig = g.cogWheelConfig
+	} else if envVal := os.Getenv(wheels.CogSDKWheelEnvVar); envVal != "" {
+		g.resolvedCogConfig, err = wheels.GetCogWheelConfig()
+		if err != nil {
+			return err
+		}
+	} else if g.Config.Build != nil && g.Config.Build.SDKVersion != "" {
+		if g.Config.Build.SDKVersion == wheels.PreReleaseSentinel {
+			g.resolvedCogConfig = &wheels.WheelConfig{
+				Source:     wheels.WheelSourcePyPI,
+				PreRelease: true,
+			}
+		} else {
+			g.resolvedCogConfig = &wheels.WheelConfig{
+				Source:  wheels.WheelSourcePyPI,
+				Version: g.Config.Build.SDKVersion,
+			}
+		}
+	} else {
+		g.resolvedCogConfig, err = wheels.GetCogWheelConfig()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Validate: refuse versions older than the minimum supported SDK
+	if err := wheels.ValidateSDKVersion(g.resolvedCogConfig, "cog"); err != nil {
+		return err
+	}
+
+	// Resolve coglet
+	if g.cogletWheelConfig != nil {
+		g.resolvedCogletConfig = g.cogletWheelConfig
+	} else {
+		g.resolvedCogletConfig, err = wheels.GetCogletWheelConfig(g.GOARCH)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// cogletMinSDKVersion is the minimum SDK version that supports coglet.
+// Older SDKs use the built-in Python HTTP server and are incompatible with coglet.
+const cogletMinSDKVersion = "0.17.0"
+
+// isLegacySDKVersion returns true if the resolved cog SDK version is explicitly
+// pinned below the minimum version that supports coglet. Returns false for
+// unpinned versions (including the "prerelease" sentinel), non-PyPI sources,
+// or unparseable versions (assume modern).
+func (g *StandardGenerator) isLegacySDKVersion() bool {
+	cfg := g.resolvedCogConfig
+	if cfg == nil || cfg.Source != wheels.WheelSourcePyPI || cfg.Version == "" {
+		return false
+	}
+	base := cfg.Version
+	if m := wheels.BaseVersionRe.FindString(base); m != "" {
+		base = m
+	}
+	ver, err := version.NewVersion(base)
+	if err != nil {
+		return false
+	}
+	return !ver.GreaterOrEqual(version.MustVersion(cogletMinSDKVersion))
+}
+
+func (g *StandardGenerator) installCog() (string, error) {
+	// Do not install Cog in base images
+	if !g.requiresCog {
+		return "", nil
+	}
+
+	if err := g.resolveCogWheelConfigs(); err != nil {
+		return "", err
+	}
+	wheelConfig := g.resolvedCogConfig
+
+	// Determine if we need --pre flag (pre-release SDK implies pre-release coglet too)
+	sdkIsPreRelease := wheelConfig.Source == wheels.WheelSourcePyPI &&
+		(wheelConfig.PreRelease || wheels.IsPreRelease(wheelConfig.Version))
+
+	if wheelConfig.PreRelease {
+		console.Warn("sdk_version \"prerelease\" installs the latest pre-release SDK. Pin to a specific version for reproducible production builds.")
+	}
+
+	// Only install coglet explicitly when there's a specific source:
+	//   - COGLET_WHEEL env var (explicit override)
+	//   - Local wheel from dist/ (dev/CI auto-detect)
+	//   - PyPI with pinned version (e.g. COGLET_WHEEL=pypi:0.17.0)
+	// Otherwise, let the SDK's own dependency handle it — cog >= 0.17.0 declares
+	// coglet as a hard dependency, older versions don't install it.
+	//
+	// Never install coglet when the SDK is explicitly pinned to < 0.17.0 — those
+	// versions use the built-in Python HTTP server and are incompatible with coglet.
+	var installLines string
+	cogletConfig := g.resolvedCogletConfig
+	explicitCoglet := cogletConfig != nil &&
+		(cogletConfig.Source == wheels.WheelSourceFile ||
+			cogletConfig.Source == wheels.WheelSourceURL ||
+			(cogletConfig.Source == wheels.WheelSourcePyPI && cogletConfig.Version != ""))
+	if explicitCoglet && g.isLegacySDKVersion() {
+		console.Info("Skipping coglet install for legacy SDK")
+		explicitCoglet = false
+	}
+	if explicitCoglet {
+		switch cogletConfig.Source {
+		case wheels.WheelSourcePyPI:
+			console.Infof("Using coglet from PyPI: %s", cogletConfig.PyPIPackageURL("coglet"))
+		case wheels.WheelSourceURL:
+			console.Infof("Using coglet wheel from URL: %s", cogletConfig.URL)
+		case wheels.WheelSourceFile:
+			console.Debugf("Using local coglet wheel: %s", cogletConfig.Path)
+		}
+
+		cogletIsPreRelease := sdkIsPreRelease ||
+			(cogletConfig.Source == wheels.WheelSourcePyPI && wheels.IsPreRelease(cogletConfig.Version))
+
+		cogletInstall, err := g.installCogletWheel(cogletConfig, cogletIsPreRelease)
+		if err != nil {
+			return "", fmt.Errorf("failed to install coglet wheel: %w", err)
+		}
+		if cogletInstall != "" {
+			installLines = cogletInstall
+		}
+	}
+
+	// Install cog SDK
+	var cogInstall string
+	var err error
+	switch wheelConfig.Source {
+	case wheels.WheelSourcePyPI:
+		cogInstall, err = g.installCogFromPyPI(wheelConfig, sdkIsPreRelease)
+	case wheels.WheelSourceURL:
+		console.Infof("Using cog wheel from URL: %s", wheelConfig.URL)
+		cogInstall, err = g.installWheelFromURL(wheelConfig.URL)
+	case wheels.WheelSourceFile:
+		console.Debugf("Using local cog wheel: %s", wheelConfig.Path)
+		cogInstall, err = g.installWheelFromFile(wheelConfig.Path)
+	default:
+		return "", fmt.Errorf("unknown wheel source: %v", wheelConfig.Source)
+	}
+	if err != nil {
+		return "", err
+	}
+	if cogInstall != "" {
+		if installLines != "" {
+			installLines += "\n"
+		}
+		installLines += cogInstall
+	}
+	if tracingInstall := g.installPythonTracingDependencies(); tracingInstall != "" {
+		installLines += "\n" + tracingInstall
+	}
+
+	return installLines, nil
+}
+
+func (g *StandardGenerator) installPythonTracingDependencies() string {
+	if g.Config.Observability == nil || g.Config.Observability.Traces == nil || !g.Config.Observability.Traces.Enabled {
+		return ""
+	}
+	install := "RUN " + uvCacheMount + " " + uvPip + " install " + g.uvPipInstallFlags("--no-cache") + " " + PythonTracingRequirements
+	if g.strip {
+		install += " && " + StripDebugSymbolsCommand
+	}
+	return install
+}
+
+// installCogFromPyPI installs the cog SDK from PyPI.
+// preRelease adds --pre to allow pip to resolve pre-release packages.
+func (g *StandardGenerator) installCogFromPyPI(config *wheels.WheelConfig, preRelease bool) (string, error) {
+	packageSpec := config.PyPIPackageURL("cog")
+	flags := "--no-cache"
+	if preRelease {
+		flags = "--pre " + flags
+	}
+	pipInstallLine := "RUN " + uvCacheMount + " " + uvPip + " install " + g.uvPipInstallFlags(flags) + " " + packageSpec
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+	lines := []string{CFlags, pipInstallLine, "ENV CFLAGS="}
+	return strings.Join(lines, "\n"), nil
+}
+
+// installWheelFromURL installs a wheel from a URL (when COG_SDK_WHEEL=https://...)
+func (g *StandardGenerator) installWheelFromURL(url string) (string, error) {
+	// Set coglet env vars if this looks like a coglet wheel
+	var envLines []string
+	if strings.Contains(url, "coglet") {
+		if !CheckMajorMinorOnly(g.Config.Build.PythonVersion) {
+			return "", fmt.Errorf("Python version must be <major>.<minor> for coglet")
+		}
+		envLines = []string{
+			"ENV R8_COG_VERSION=coglet",
+			"ENV R8_PYTHON_VERSION=" + g.Config.Build.PythonVersion,
+		}
+	}
+
+	// For coglet URLs, uninstall cog first to avoid conflicts with coglet's cog shim package.
+	// Some base images (e.g. r8.im/cog-base) have cog pre-installed, which conflicts
+	// with coglet's cog compatibility shim that provides the same module paths.
+	var pipPrefix string
+	if strings.Contains(url, "coglet") {
+		uninstallFlags := ""
+		if g.needsBreakSystemPackages() {
+			uninstallFlags = " " + uvBreakSystemPackages
+		}
+		pipPrefix = uvPip + " uninstall" + uninstallFlags + " cog 2>/dev/null || true && "
+	}
+	pipInstallLine := "RUN " + uvCacheMount + " " + pipPrefix + uvPip + " install " + g.uvPipInstallFlags("--no-cache") + " " + url
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+
+	envLines = append(envLines, CFlags, pipInstallLine, "ENV CFLAGS=")
+	return strings.Join(envLines, "\n"), nil
+}
+
+// installWheelFromFile installs a wheel from a local file (when COG_SDK_WHEEL=/path/to/file.whl)
+func (g *StandardGenerator) installWheelFromFile(path string) (string, error) {
+	// Read the local wheel file
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read wheel file %s: %w", path, err)
+	}
+
+	filename := filepath.Base(path)
+	lines, containerPath, err := g.writeTemp(filename, data)
+	if err != nil {
+		return "", err
+	}
+
+	// Set coglet env vars if this looks like a coglet wheel
+	var pipPrefix string
+	if strings.Contains(filename, "coglet") {
+		if !CheckMajorMinorOnly(g.Config.Build.PythonVersion) {
+			return "", fmt.Errorf("Python version must be <major>.<minor> for coglet")
+		}
+		lines = append(lines,
+			"ENV R8_COG_VERSION=coglet",
+			"ENV R8_PYTHON_VERSION="+g.Config.Build.PythonVersion,
+		)
+		// Uninstall cog first to avoid conflicts with coglet's cog shim package.
+		// Some base images (e.g. r8.im/cog-base) have cog pre-installed, which conflicts
+		// with coglet's cog compatibility shim that provides the same module paths.
+		uninstallFlags := ""
+		if g.needsBreakSystemPackages() {
+			uninstallFlags = " " + uvBreakSystemPackages
+		}
+		pipPrefix = uvPip + " uninstall" + uninstallFlags + " cog 2>/dev/null || true && "
+	}
+
+	pipInstallLine := "RUN " + uvCacheMount + " " + pipPrefix + uvPip + " install " + g.uvPipInstallFlags("--no-cache") + " " + containerPath
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+	lines = append(lines, CFlags, pipInstallLine, "ENV CFLAGS=")
+	return strings.Join(lines, "\n"), nil
+}
+
+// installCogletWheel installs the coglet wheel based on the provided config.
+// preRelease adds --pre to allow pip to resolve pre-release packages.
+func (g *StandardGenerator) installCogletWheel(config *wheels.WheelConfig, preRelease bool) (string, error) {
+	switch config.Source {
+	case wheels.WheelSourcePyPI:
+		return g.installCogletFromPyPI(config, preRelease)
+	case wheels.WheelSourceURL:
+		return g.installCogletFromURL(config.URL)
+	case wheels.WheelSourceFile:
+		return g.installCogletFromFile(config.Path)
+	default:
+		return "", fmt.Errorf("unknown coglet wheel source: %v", config.Source)
+	}
+}
+
+// installCogletFromPyPI installs coglet from PyPI.
+// preRelease adds --pre to allow pip to resolve pre-release packages.
+func (g *StandardGenerator) installCogletFromPyPI(config *wheels.WheelConfig, preRelease bool) (string, error) {
+	packageSpec := config.PyPIPackageURL("coglet")
+	flags := "--no-cache"
+	if preRelease {
+		flags = "--pre " + flags
+	}
+	pipInstallLine := "RUN " + uvCacheMount + " " + uvPip + " install " + g.uvPipInstallFlags(flags) + " " + packageSpec
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+	lines := []string{CFlags, pipInstallLine, "ENV CFLAGS="}
+	return strings.Join(lines, "\n"), nil
+}
+
+// installCogletFromURL installs coglet from a URL
+func (g *StandardGenerator) installCogletFromURL(url string) (string, error) {
+	pipInstallLine := "RUN " + uvCacheMount + " " + uvPip + " install " + g.uvPipInstallFlags("--no-cache") + " " + url
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+	lines := []string{CFlags, pipInstallLine, "ENV CFLAGS="}
+	return strings.Join(lines, "\n"), nil
+}
+
+// installCogletFromFile installs coglet from a local wheel file
+func (g *StandardGenerator) installCogletFromFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("failed to read coglet wheel %s: %w", path, err)
+	}
+
+	filename := filepath.Base(path)
+	lines, containerPath, err := g.writeTemp(filename, data)
+	if err != nil {
+		return "", err
+	}
+
+	pipInstallLine := "RUN " + uvCacheMount + " " + uvPip + " install " + g.uvPipInstallFlags("--no-cache") + " " + containerPath
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+
+	lines = append(lines, CFlags, pipInstallLine, "ENV CFLAGS=")
+	return strings.Join(lines, "\n"), nil
+}
+
+// filterManagedPackages strips cog and coglet from user requirements content,
+// warning loudly for each occurrence. requirements.txt is not the intended
+// mechanism for controlling cog/coglet versions — use build.sdk_version in
+// cog.yaml or the COG_SDK_WHEEL / COGLET_WHEEL environment variables instead.
+func (g *StandardGenerator) filterManagedPackages(reqContents string) string {
+	// Build a human-readable description of what the build system will install
+	// for each managed package, so the warning is actionable.
+	override := func(pkg string) string {
+		var cfg *wheels.WheelConfig
+		if pkg == "cog" {
+			cfg = g.resolvedCogConfig
+		} else {
+			cfg = g.resolvedCogletConfig
+		}
+		if cfg == nil {
+			return "latest from PyPI"
+		}
+		switch cfg.Source {
+		case wheels.WheelSourcePyPI:
+			if cfg.Version != "" {
+				return fmt.Sprintf("%s==%s from PyPI", pkg, cfg.Version)
+			}
+			if cfg.PreRelease {
+				return "latest pre-release " + pkg + " from PyPI"
+			}
+			return "latest " + pkg + " from PyPI"
+		case wheels.WheelSourceURL:
+			return cfg.URL
+		case wheels.WheelSourceFile:
+			return cfg.Path
+		default:
+			return "unknown source"
+		}
+	}
+
+	managed := map[string]bool{"cog": true, "coglet": true}
+	var filtered []string
+	for line := range strings.SplitSeq(reqContents, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "-") {
+			filtered = append(filtered, line)
+			continue
+		}
+		pkgName := requirements.PackageName(trimmed)
+		baseName := strings.ToLower(strings.Split(pkgName, "[")[0])
+		if managed[baseName] {
+			console.Warnf(
+				"'%s' found in requirements — overriding with %s. "+
+					"Remove it from requirements and use build.sdk_version in cog.yaml or %s to control the version.",
+				trimmed,
+				override(baseName),
+				map[string]string{"cog": wheels.CogSDKWheelEnvVar, "coglet": wheels.CogletWheelEnvVar}[baseName],
+			)
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func (g *StandardGenerator) pipInstalls() (string, error) {
+	// Resolve wheel configs early so filterManagedPackages can emit precise warnings.
+	if g.requiresCog {
+		if err := g.resolveCogWheelConfigs(); err != nil {
+			return "", err
+		}
+	}
+
+	var err error
+	includePackages := []string{}
+	if torchVersion, ok := g.Config.TorchVersion(); ok {
+		includePackages = []string{"torch==" + torchVersion}
+	}
+	if torchvisionVersion, ok := g.Config.TorchvisionVersion(); ok {
+		includePackages = append(includePackages, "torchvision=="+torchvisionVersion)
+	}
+	if torchaudioVersion, ok := g.Config.TorchaudioVersion(); ok {
+		includePackages = append(includePackages, "torchaudio=="+torchaudioVersion)
+	}
+	if tensorflowVersion, ok := g.Config.TensorFlowVersion(); ok {
+		includePackages = append(includePackages, "tensorflow=="+tensorflowVersion)
+	}
+	g.pythonRequirementsContents, err = g.Config.PythonRequirementsForArch(g.GOOS, g.GOARCH, includePackages)
+	if err != nil {
+		return "", err
+	}
+
+	var artifactCopyLine string
+	g.pythonRequirementsContents, artifactCopyLine, err = g.stageLocalPackageArtifacts(g.pythonRequirementsContents)
+	if err != nil {
+		return "", err
+	}
+	// Strip cog/coglet from user requirements — we always install them ourselves
+	// via installCog(). Local paths have already been rewritten and cannot be
+	// mistaken for managed package names.
+	g.pythonRequirementsContents = g.filterManagedPackages(g.pythonRequirementsContents)
+
+	if strings.Trim(g.pythonRequirementsContents, "") == "" {
+		return "", nil
+	}
+
+	console.Debugf("Generated requirements.txt:\n%s", g.pythonRequirementsContents)
+	copyLine, containerPath, err := g.writeTemp("requirements.txt", []byte(g.pythonRequirementsContents))
+	if err != nil {
+		return "", err
+	}
+
+	pipInstallLine := "RUN --mount=type=cache,target=/root/.cache/pip uv run pip install " + g.uvPipInstallFlags("--cache-dir /root/.cache/pip") + " -r " + containerPath
+	if g.strip {
+		pipInstallLine += " && " + StripDebugSymbolsCommand
+	}
+	return strings.Join(filterEmpty([]string{
+		artifactCopyLine,
+		copyLine[0],
+		CFlags,
+		pipInstallLine,
+		"ENV CFLAGS=",
+		g.resetManagedPackages(),
+	}), "\n"), nil
+}
+
+func (g *StandardGenerator) resetManagedPackages() string {
+	if !g.requiresCog || len(g.Config.LocalPackageArtifacts()) == 0 {
+		return ""
+	}
+	flags := ""
+	if g.needsBreakSystemPackages() {
+		flags = " " + uvBreakSystemPackages
+	}
+	return "RUN " + uvPip + " uninstall" + flags + " cog coglet"
+}
+
+func (g *StandardGenerator) stageLocalPackageArtifacts(reqContents string) (string, string, error) {
+	artifacts := g.Config.LocalPackageArtifacts()
+	if len(artifacts) == 0 {
+		return reqContents, "", nil
+	}
+
+	root, err := os.OpenRoot(g.Dir)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to open project directory: %w", err)
+	}
+	defer root.Close()
+
+	projectRoot, err := filepath.Abs(g.Dir)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve project directory: %w", err)
+	}
+	projectRoot, err = filepath.EvalSymlinks(projectRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve project directory symlinks: %w", err)
+	}
+	openedRootInfo, err := root.Stat(".")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to inspect project directory: %w", err)
+	}
+	resolvedRootInfo, err := os.Stat(projectRoot)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to inspect resolved project directory: %w", err)
+	}
+	if !os.SameFile(openedRootInfo, resolvedRootInfo) {
+		return "", "", fmt.Errorf("project directory changed while staging local Python package artifacts")
+	}
+	if g.buildRoot == nil {
+		return "", "", fmt.Errorf("build directory is not open")
+	}
+
+	containerPaths := map[string]string{}
+	staged := map[string]bool{}
+	for _, artifact := range artifacts {
+		sourcePath, err := filepath.Rel(projectRoot, artifact.SourcePath)
+		if err != nil || !pathStaysWithinRoot(sourcePath) {
+			return "", "", fmt.Errorf("local Python package artifact %q must be inside the project directory", artifact.Requirement)
+		}
+		if !pathStaysWithinRoot(artifact.RelativePath) {
+			return "", "", fmt.Errorf("invalid staged path for local Python package artifact %q", artifact.Requirement)
+		}
+		if !staged[artifact.RelativePath] {
+			destinationPath := filepath.Join(localArtifactsDir, artifact.RelativePath)
+			if err := copyLocalPackageArtifact(root, sourcePath, g.buildRoot, destinationPath); err != nil {
+				return "", "", fmt.Errorf("failed to stage local Python package artifact %s: %w", artifact.SourcePath, err)
+			}
+			staged[artifact.RelativePath] = true
+		}
+		containerPaths[artifact.Requirement] = path.Join(localArtifactsContainerDir, filepath.ToSlash(artifact.RelativePath))
+	}
+	lines := []string{}
+	matched := map[string]bool{}
+	for line := range strings.SplitSeq(reqContents, "\n") {
+		requirement := strings.TrimSpace(line)
+		if replacement, ok := containerPaths[requirement]; ok {
+			lines = append(lines, replacement)
+			matched[requirement] = true
+		} else {
+			lines = append(lines, line)
+		}
+	}
+	for requirement := range containerPaths {
+		if !matched[requirement] {
+			return "", "", fmt.Errorf("failed to rewrite local Python package artifact %q", requirement)
+		}
+	}
+	return strings.Join(lines, "\n"), fmt.Sprintf("COPY --from=cog_build %s/ %s/", localArtifactsDir, localArtifactsContainerDir), nil
+}
+
+func copyLocalPackageArtifact(sourceRoot *os.Root, sourcePath string, destinationRoot *os.Root, destinationPath string) error {
+	source, err := sourceRoot.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source must be a regular file")
+	}
+	return writeBuildFile(destinationRoot, destinationPath, source)
+}
+
+func writeBuildFile(root *os.Root, destinationPath string, source io.Reader) error {
+	if !pathStaysWithinRoot(destinationPath) {
+		return fmt.Errorf("invalid build path %q", destinationPath)
+	}
+	if err := root.MkdirAll(filepath.Dir(destinationPath), 0o755); err != nil {
+		return err
+	}
+	tmpPath := destinationPath + ".tmp"
+	if err := root.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	destination, err := root.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		_ = destination.Close()
+		_ = root.Remove(tmpPath)
+		return err
+	}
+	if err := destination.Close(); err != nil {
+		_ = root.Remove(tmpPath)
+		return err
+	}
+	if err := root.Rename(tmpPath, destinationPath); err != nil {
+		_ = root.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func pathStaysWithinRoot(path string) bool {
+	if path == "" || filepath.IsAbs(path) || path == ".." {
+		return false
+	}
+	return !strings.HasPrefix(path, ".."+string(filepath.Separator))
+}
+
+func (g *StandardGenerator) runCommands() (string, error) {
+	runCommands := g.Config.Build.Run
+
+	// For backwards compatibility
+	for _, command := range g.Config.Build.PreInstall {
+		runCommands = append(runCommands, config.RunItem{Command: command})
+	}
+
+	lines := []string{}
+	for _, run := range runCommands {
+		command := strings.TrimSpace(run.Command)
+		if strings.Contains(command, "\n") {
+			return "", fmt.Errorf(`One of the commands in 'run' contains a new line, which won't work. You need to create a new list item in YAML prefixed with '-' for each command.
+
+This is the offending line: %s`, command)
+		}
+
+		if len(run.Mounts) > 0 {
+			mounts := []string{}
+			for _, mount := range run.Mounts {
+				if mount.Type == "secret" {
+					secretMount := fmt.Sprintf("--mount=type=secret,id=%s,target=%s", mount.ID, mount.Target)
+					mounts = append(mounts, secretMount)
+				}
+			}
+			lines = append(lines, fmt.Sprintf("RUN %s %s", strings.Join(mounts, " "), command))
+		} else {
+			lines = append(lines, "RUN "+command)
+		}
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func (g *StandardGenerator) envVars() (string, error) {
+	return envLineFromConfig(g.Config)
+}
+
+// installCACert generates Dockerfile lines to install a custom CA certificate.
+// If COG_CA_CERT is not set, returns empty string (no-op).
+func (g *StandardGenerator) installCACert() (string, error) {
+	certData, err := ReadCACert()
+	if err != nil {
+		return "", err
+	}
+	if certData == nil {
+		return "", nil
+	}
+	return GenerateCACertInstall(certData, g.writeTemp)
+}
+
+// writeTemp writes a file to the build cache directory (.cog/build/) and
+// returns the Dockerfile lines to COPY it into the container. Files are
+// referenced via the "cog_build" named build context so the path is
+// relative to .cog/build/, not the project root.
+func (g *StandardGenerator) writeTemp(filename string, contents []byte) ([]string, string, error) {
+	if g.buildRoot == nil {
+		return []string{}, "", fmt.Errorf("build directory is not open")
+	}
+	if err := writeBuildFile(g.buildRoot, filename, bytes.NewReader(contents)); err != nil {
+		return []string{}, "", fmt.Errorf("Failed to write %s: %w", filename, err)
+	}
+	return []string{fmt.Sprintf("COPY --from=cog_build %s /tmp/%s", filename, filename)}, "/tmp/" + filename, nil
+}
+
+func joinStringsWithoutLineSpace(chunks []string) string {
+	lines := []string{}
+	for _, chunk := range chunks {
+		chunkLines := strings.Split(chunk, "\n")
+		lines = append(lines, chunkLines...)
+	}
+	return strings.Join(filterEmpty(lines), "\n")
+}
+
+func filterEmpty(list []string) []string {
+	filtered := []string{}
+	for _, s := range list {
+		if s != "" {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
+}
+
+func (g *StandardGenerator) GenerateWeightsManifest(ctx context.Context) (*weightslegacy.Manifest, error) {
+	m := weightslegacy.NewManifest()
+
+	for _, dir := range g.modelDirs {
+		err := g.fileWalker(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() {
+				return nil
+			}
+
+			return m.AddFile(path)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, path := range g.modelFiles {
+		err := m.AddFile(path)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return m, nil
+}
+
+func (g *StandardGenerator) determineBaseImageName(ctx context.Context) (string, error) {
+	var changed bool
+	var err error
+
+	cudaVersion := g.Config.Build.CUDA
+
+	pythonVersion := g.Config.Build.PythonVersion
+	pythonVersion, changed, err = stripPatchVersion(pythonVersion)
+	if err != nil {
+		return "", err
+	}
+	if changed {
+		console.Warnf("Stripping patch version from Python version %s to %s", g.Config.Build.PythonVersion, pythonVersion)
+	}
+
+	torchVersion, _ := g.Config.TorchVersion()
+
+	// validate that the base image configuration exists
+	imageGenerator, err := NewBaseImageGenerator(ctx, g.client, cudaVersion, pythonVersion, torchVersion, g.command, false)
+	if err != nil {
+		return "", err
+	}
+	baseImage := BaseImageName(imageGenerator.cudaVersion, imageGenerator.pythonVersion, imageGenerator.torchVersion)
+	return baseImage, nil
+}
+
+func stripPatchVersion(versionString string) (string, bool, error) {
+	if versionString == "" {
+		return "", false, nil
+	}
+
+	v, err := version.NewVersion(versionString)
+	if err != nil {
+		return "", false, fmt.Errorf("Invalid version: %s", versionString)
+	}
+
+	strippedVersion := fmt.Sprintf("%d.%d", v.Major, v.Minor)
+	changed := strippedVersion != versionString
+
+	return strippedVersion, changed, nil
+}

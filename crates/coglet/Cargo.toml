@@ -1,0 +1,91 @@
+[package]
+name = "coglet"
+description = "High-performance prediction server for Cog ML models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["tracing", "tracing-grpc"]
+tracing = [
+    "dep:opentelemetry",
+    "dep:opentelemetry-jaeger-propagator",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "opentelemetry-otlp/http-proto",
+    "opentelemetry-otlp/reqwest-blocking-client",
+    "opentelemetry-otlp/trace",
+]
+tracing-grpc = [
+    "tracing",
+    "opentelemetry-otlp/grpc-tonic",
+    "opentelemetry-otlp/tls-ring",
+    "opentelemetry-otlp/tls-webpki-roots",
+]
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["codec", "rt"] }
+futures.workspace = true
+async-trait = "0.1"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Encoding
+base64 = "0.22.1"
+mime_guess = "2.0.5"
+
+# Identifiers
+uuid.workspace = true
+
+# HTTP server
+axum.workspace = true
+
+# HTTP client (webhooks)
+reqwest.workspace = true
+ureq = { version = "3", default-features = false, features = ["json", "rustls", "platform-verifier"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Input validation
+jsonschema = "0.29"
+
+# Concurrent collections
+dashmap = "6"
+
+# TLS
+rustls.workspace = true
+
+# Observability
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"], optional = true }
+opentelemetry-jaeger-propagator = { version = "=0.32.0", default-features = false, optional = true }
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, optional = true }
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace"], optional = true }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "fs"] }
+
+[dev-dependencies]
+insta.workspace = true
+tempfile = "3"
+wiremock = "0.6"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["testing", "trace"] }

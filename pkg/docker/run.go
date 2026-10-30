@@ -1,0 +1,86 @@
+package docker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
+
+	"github.com/docker/go-connections/nat"
+
+	"github.com/replicate/cog/pkg/docker/command"
+	"github.com/replicate/cog/pkg/util/console"
+)
+
+var ErrMissingDeviceDriver = errors.New("Docker is missing required device driver")
+
+func Run(ctx context.Context, dockerClient command.Command, options command.RunOptions) error {
+	return RunWithIO(ctx, dockerClient, options, os.Stdin, os.Stdout, os.Stderr)
+}
+
+func RunWithIO(ctx context.Context, dockerClient command.Command, options command.RunOptions, stdin io.Reader, stdout, stderr io.Writer) error {
+	options.Stdin = stdin
+	options.Stdout = stdout
+	options.Stderr = stderr
+	// TODO[md]: we're gonna stop passing the entire host env to the container by default, if users indeed rely on that behavior we can uncomment this line:
+	// options.Env = append(os.Environ(), options.Env...)
+	return dockerClient.Run(ctx, options)
+}
+
+func RunDaemon(ctx context.Context, dockerClient command.Command, options command.RunOptions, stderr io.Writer) (string, error) {
+	options.Stderr = stderr
+	return dockerClient.ContainerStart(ctx, options)
+}
+
+func GetHostPortForContainer(ctx context.Context, dockerCommand command.Command, containerID string, containerPort int, hostIP string) (int, error) {
+	console.Debugf("=== DockerCommand.GetPort %s/%d", containerID, containerPort)
+
+	if hostIP == "" {
+		hostIP = command.DefaultHostIP
+	}
+
+	inspect, err := dockerCommand.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to inspect container %q: %w", containerID, err)
+	}
+
+	if inspect.ContainerJSONBase == nil || inspect.State == nil || !inspect.State.Running {
+		return 0, fmt.Errorf("container %s is not running", containerID)
+	}
+
+	targetPort, err := nat.NewPort("tcp", strconv.Itoa(containerPort))
+	if err != nil {
+		return 0, fmt.Errorf("failed to create target port: %w", err)
+	}
+
+	if inspect.NetworkSettings == nil || inspect.NetworkSettings.Ports == nil {
+		return 0, fmt.Errorf("container %s does not have expected network configuration", containerID)
+	}
+
+	bindings := inspect.NetworkSettings.Ports[targetPort]
+	for _, portBinding := range bindings {
+		if portBinding.HostIP != hostIP {
+			continue
+		}
+		hostPort, err := nat.ParsePort(portBinding.HostPort)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse host port: %w", err)
+		}
+		return hostPort, nil
+	}
+
+	// Fall back to a single wildcard or unspecified binding. Docker may report
+	// 0.0.0.0 or an empty HostIP even when we requested a specific localhost
+	// address, and such a binding is reachable on localhost.
+	if len(bindings) == 1 && (bindings[0].HostIP == "" || bindings[0].HostIP == "0.0.0.0") {
+		hostPort, err := nat.ParsePort(bindings[0].HostPort)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse host port: %w", err)
+		}
+		return hostPort, nil
+	}
+
+	return 0, fmt.Errorf("container %s does not have a port bound to %s", containerID, hostIP)
+}

@@ -1,0 +1,111 @@
+package model
+
+import (
+	"os"
+	"path/filepath"
+
+	"github.com/replicate/cog/pkg/config"
+	"github.com/replicate/cog/pkg/dotcog"
+	"github.com/replicate/cog/pkg/util/console"
+)
+
+// Source represents a Cog project ready to build.
+// It combines the parsed configuration with the project directory location.
+type Source struct {
+	Config         *config.Config
+	ProjectDir     string
+	ConfigFilename string // Base filename like "cog.yaml" or "my-config.yaml"
+	Warnings       []config.DeprecationWarning
+	DotCog         *dotcog.Dir // .cog/ project state directory; nil when created via NewSourceFromConfig
+}
+
+// NewSource loads configuration from the given path and returns a Source.
+// The configPath can be a filename (e.g., "cog.yaml") which will be searched
+// for in the current directory and parent directories.
+func NewSource(configPath string) (*Source, error) {
+	if configPath == "" {
+		configPath = "cog.yaml"
+	}
+
+	// Find the root project directory
+	rootDir, err := config.GetProjectDir(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Open and read the config file
+	fullPath := filepath.Join(rootDir, configPath)
+	f, err := os.Open(fullPath)
+	if err != nil {
+		return nil, &config.ParseError{Filename: configPath, Err: err}
+	}
+	defer f.Close()
+
+	result, err := config.Load(f, rootDir)
+	if err != nil {
+		// Add filename context to parse errors if not already present
+		if parseErr, ok := err.(*config.ParseError); ok && parseErr.Filename == "" {
+			parseErr.Filename = configPath
+		}
+		return nil, err
+	}
+
+	// Display deprecation warnings
+	for _, w := range result.Warnings {
+		console.Warnf("%s", w.Error())
+	}
+
+	dc, err := dotcog.Open(result.RootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Source{
+		Config:         result.Config,
+		ProjectDir:     result.RootDir,
+		ConfigFilename: filepath.Base(configPath),
+		Warnings:       result.Warnings,
+		DotCog:         dc,
+	}, nil
+}
+
+// NewSourceFromConfig creates a Source from an existing Config.
+// Use this when you already have a parsed config and know the project directory.
+// DotCog is not initialized; callers that need it should set it separately.
+func NewSourceFromConfig(cfg *config.Config, projectDir string) *Source {
+	return &Source{
+		Config:         cfg,
+		ProjectDir:     projectDir,
+		ConfigFilename: "cog.yaml",
+	}
+}
+
+// Close releases resources held by the Source, including the .cog/ directory handle.
+func (s *Source) Close() error {
+	if s.DotCog == nil {
+		return nil
+	}
+	return s.DotCog.Close()
+}
+
+// ArtifactSpecs returns the artifact declarations derived from this
+// source: one ImageSpec plus one WeightSpec per configured weight.
+// Returns an error if any weight's source URI is malformed. Returns
+// (nil, nil) if Config is nil.
+func (s *Source) ArtifactSpecs() ([]ArtifactSpec, error) {
+	if s.Config == nil {
+		return nil, nil
+	}
+
+	specs := []ArtifactSpec{NewImageSpec("model", s.Config.Image)}
+
+	for _, w := range s.Config.Weights {
+		ws, err := WeightSpecFromConfig(w)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, ws)
+	}
+
+	return specs, nil
+}

@@ -1,0 +1,173 @@
+package config
+
+import (
+	"fmt"
+	"io"
+
+	"go.yaml.in/yaml/v4"
+)
+
+// parse reads and parses YAML content from an io.Reader into a configFile.
+// This only does YAML parsing - no validation or defaults.
+// Returns ParseError if the content cannot be read or parsed.
+func parse(r io.Reader) (*configFile, error) {
+	contents, err := io.ReadAll(r)
+	if err != nil {
+		return nil, &ParseError{Err: err}
+	}
+
+	return parseBytes(contents)
+}
+
+// parseBytes parses YAML content into a configFile.
+func parseBytes(contents []byte) (*configFile, error) {
+	cfg := &configFile{}
+
+	if len(contents) == 0 {
+		// Empty file is valid, returns empty config
+		return cfg, nil
+	}
+
+	if err := yaml.Unmarshal(contents, cfg); err != nil {
+		// NOTE: We intentionally use %v instead of %w here.
+		// The yaml v4 library's LoadErrors type has a buggy Is() method
+		// that causes infinite recursion when errors.Is traverses the
+		// error chain. By using %v we break the chain and prevent
+		// stack overflows when callers check the error.
+		return nil, &ParseError{
+			Err: fmt.Errorf("invalid YAML: %v", err),
+		}
+	}
+
+	return cfg, nil
+}
+
+// FromYAML parses YAML content into an uncompleted Config.
+// This is a convenience function primarily for testing.
+// Callers should call Complete() on the returned config to resolve CUDA versions etc.
+// For production code, use Load() which handles validation and completion.
+//
+// Note: This function skips validation since it has no project directory context.
+// The Complete() method will validate requirements files exist when called.
+func FromYAML(contents []byte) (*Config, error) {
+	cfgFile, err := parseBytes(contents)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to Config struct without completion or validation
+	// The caller should call Complete() with the appropriate project dir
+	return configFileToConfig(cfgFile)
+}
+
+// configFileToConfig converts a ConfigFile to a Config without running completion logic.
+// This is the minimal conversion used by FromYAML for test compatibility.
+func configFileToConfig(cfg *configFile) (*Config, error) {
+	config := &Config{
+		Build: &Build{},
+	}
+
+	if cfg.Build != nil {
+		if cfg.Build.GPU != nil {
+			config.Build.GPU = *cfg.Build.GPU
+		}
+		if cfg.Build.PythonVersion != nil {
+			config.Build.PythonVersion = *cfg.Build.PythonVersion
+		}
+		if cfg.Build.PythonRequirements != nil {
+			config.Build.PythonRequirements = *cfg.Build.PythonRequirements
+		}
+		config.Build.PythonPackages = cfg.Build.PythonPackages
+		config.Build.SystemPackages = cfg.Build.SystemPackages
+		config.Build.PreInstall = cfg.Build.PreInstall
+		if cfg.Build.CUDA != nil {
+			config.Build.CUDA = *cfg.Build.CUDA
+		}
+		if cfg.Build.CuDNN != nil {
+			config.Build.CuDNN = *cfg.Build.CuDNN
+		}
+		if cfg.Build.SDKVersion != nil {
+			config.Build.SDKVersion = *cfg.Build.SDKVersion
+		}
+
+		// Convert Run items
+		config.Build.Run = make([]RunItem, len(cfg.Build.Run))
+		for i, runFile := range cfg.Build.Run {
+			config.Build.Run[i] = RunItem{
+				Command: runFile.Command,
+			}
+			if len(runFile.Mounts) > 0 {
+				config.Build.Run[i].Mounts = make([]struct {
+					Type   string `json:"type,omitempty" yaml:"type"`
+					ID     string `json:"id,omitempty" yaml:"id"`
+					Target string `json:"target,omitempty" yaml:"target"`
+				}, len(runFile.Mounts))
+				for j, mountFile := range runFile.Mounts {
+					config.Build.Run[i].Mounts[j].Type = mountFile.Type
+					config.Build.Run[i].Mounts[j].ID = mountFile.ID
+					config.Build.Run[i].Mounts[j].Target = mountFile.Target
+				}
+			}
+		}
+	}
+
+	if cfg.Image != nil {
+		config.Image = *cfg.Image
+	}
+	if cfg.Model != nil {
+		config.Model = *cfg.Model
+	}
+	if cfg.Run != nil && cfg.Predict != nil && *cfg.Run != "" && *cfg.Predict != "" {
+		return nil, &ValidationError{Field: "run", Message: "only one of run or predict can be set"}
+	}
+	if cfg.Run != nil && *cfg.Run != "" {
+		config.Predict = *cfg.Run
+	} else if cfg.Predict != nil {
+		config.Predict = *cfg.Predict
+	}
+	if cfg.Train != nil {
+		config.Train = *cfg.Train
+	}
+	if cfg.Concurrency != nil {
+		config.Concurrency = &Concurrency{}
+		if cfg.Concurrency.Max != nil {
+			config.Concurrency.Max = *cfg.Concurrency.Max
+		}
+	}
+	if cfg.Observability != nil {
+		config.Observability = &Observability{}
+		if cfg.Observability.Config != nil {
+			config.Observability.Config = *cfg.Observability.Config
+		}
+		if cfg.Observability.Traces != nil {
+			traces := cfg.Observability.Traces
+			config.Observability.Traces = &Tracing{Sampler: "parentbased_always_off", TraceHeaderFormat: "w3c"}
+			if traces.Enabled != nil {
+				config.Observability.Traces.Enabled = *traces.Enabled
+			}
+			if traces.Sampler != nil {
+				config.Observability.Traces.Sampler = *traces.Sampler
+			}
+			if traces.SamplerArg != nil {
+				config.Observability.Traces.SamplerArg = *traces.SamplerArg
+			}
+			if traces.TraceHeader != nil {
+				config.Observability.Traces.TraceHeader = *traces.TraceHeader
+			}
+			if traces.TraceHeaderFormat != nil {
+				config.Observability.Traces.TraceHeaderFormat = *traces.TraceHeaderFormat
+			}
+		}
+	}
+	config.Environment = cfg.Environment
+
+	// Convert weights
+	if len(cfg.Weights) > 0 {
+		config.Weights = make([]WeightSource, len(cfg.Weights))
+		for i, w := range cfg.Weights {
+			config.Weights[i] = WeightSource(w)
+		}
+	}
+
+	return config, nil
+}

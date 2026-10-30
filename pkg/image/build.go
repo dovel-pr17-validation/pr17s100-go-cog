@@ -1,0 +1,790 @@
+package image
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+
+	"github.com/replicate/cog/pkg/config"
+	"github.com/replicate/cog/pkg/docker/command"
+	"github.com/replicate/cog/pkg/dockerfile"
+	"github.com/replicate/cog/pkg/dotcog"
+	"github.com/replicate/cog/pkg/global"
+	"github.com/replicate/cog/pkg/registry"
+	"github.com/replicate/cog/pkg/schema"
+	"github.com/replicate/cog/pkg/schema/openapi"
+	"github.com/replicate/cog/pkg/schema/python"
+	"github.com/replicate/cog/pkg/util/console"
+	"github.com/replicate/cog/pkg/util/files"
+	weightslockfile "github.com/replicate/cog/pkg/weights/lockfile"
+	"github.com/replicate/cog/pkg/weightslegacy"
+)
+
+// cogBuildContextName is the named build context for build staging
+// artifacts (.cog/build/). Dockerfile COPY instructions reference it
+// via --from=cog_build.
+const cogBuildContextName = "cog_build"
+
+// defaultExcludePatterns filters .cog/ out of the project context mount
+// so weight blobs, mount dirs, and build caches are never sent to the
+// Docker daemon.
+var defaultExcludePatterns = []string{dotcog.Name + "/"}
+
+var errGit = errors.New("git error")
+
+// buildPaths holds resolved file paths within the .cog/ directory for a
+// single build invocation. Avoids hardcoded path constants spread across
+// helper functions.
+type buildPaths struct {
+	buildDir        string // .cog/build/ -- staging dir for wheels, schema, manifest
+	schemaFile      string // .cog/build/openapi_schema.json
+	weightsFile     string // .cog/build/weights.json
+	weightsManifest string // .cog/cache/weights_manifest.json (legacy separate-weights)
+	// rootSchemaFile and rootWeightsFile are copies at .cog/ root level.
+	// When cog predict/train/serve volume-mounts the project dir at /src,
+	// the host's .cog/ shadows the image's .cog/ -- so coglet needs these
+	// files on the host filesystem, not just in the image layer.
+	rootSchemaFile  string // .cog/openapi_schema.json
+	rootWeightsFile string // .cog/weights.json
+}
+
+// Build a Cog model from a config and returns the image ID (sha256:...) on success.
+//
+// This is separated out from docker.Build(), so that can be as close as possible to the behavior of 'docker build'.
+func Build(
+	ctx context.Context,
+	cfg *config.Config,
+	dc *dotcog.Dir,
+	dir,
+	imageName string,
+	configFilename string,
+	secrets []string,
+	noCache,
+	separateWeights bool,
+	useCudaBaseImage string,
+	progressOutput string,
+	schemaFile string,
+	openAPISchema []byte,
+	dockerfileFile string,
+	useCogBaseImage *bool,
+	strip bool,
+	precompile bool,
+	excludeSource bool,
+	skipSchemaValidation bool,
+	skipLabels bool,
+	annotations map[string]string,
+	dockerCommand command.Command,
+	client registry.Client) (string, error) {
+	release, err := dc.Lock(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	// Resolve build artifact paths from the .cog/ directory. TempPath
+	// registers .cog/build/ for removal on dc.Close(), so build staging
+	// artifacts don't accumulate between invocations.
+	buildDir, err := dc.TempPath("build")
+	if err != nil {
+		return "", fmt.Errorf("create build cache dir: %w", err)
+	}
+	bp := buildPaths{
+		buildDir:        buildDir,
+		schemaFile:      filepath.Join(buildDir, "openapi_schema.json"),
+		weightsFile:     filepath.Join(buildDir, "weights.json"),
+		weightsManifest: filepath.Join(dc.Root(), "cache", "weights_manifest.json"),
+		// Schema and weights also go under .cog/ root so they're visible
+		// when the project dir is volume-mounted at /src (cog predict/train/serve).
+		// The bundle step COPYs from .cog/build/ via the cog_build context,
+		// but the volume mount shadows the image's /src/.cog/ with the host's.
+		rootSchemaFile:  filepath.Join(dc.Root(), "openapi_schema.json"),
+		rootWeightsFile: filepath.Join(dc.Root(), "weights.json"),
+	}
+
+	needsSchema := !skipSchemaValidation && schemaFile == ""
+
+	// --- Predictor metadata (decorator concurrency, async detection) ---
+	// Statically parse the predictor for decorator-derived concurrency. When
+	// schema validation is skipped or an external schema is supplied, the user
+	// has opted out of static source parsing, so treat parse failures as
+	// non-fatal and fall back to cog.yaml-only concurrency instead of failing
+	// the build.
+	predictorInfo, err := generatePredictorMetadata(cfg, dir)
+	if err != nil {
+		if needsSchema {
+			return "", fmt.Errorf("image build failed: %w", err)
+		}
+		console.Debugf("Skipping decorator concurrency detection: %v", err)
+		predictorInfo = nil
+	}
+
+	// --- Pre-build static schema generation ---
+	// Resolve the schema before the Docker build so schema errors fail fast and
+	// the schema file is available in the build context.
+	schemaJSON, err := resolveBuildSchema(cfg, dir, schemaFile, openAPISchema, needsSchema, skipSchemaValidation)
+	if err != nil {
+		return "", err
+	}
+
+	// Write and validate pre-build schema (static or from file).
+	// Written atomically to .cog/ root (visible via volume mount for
+	// cog predict/train/serve), then copied to .cog/build/ for the
+	// cog_build named build context.
+	if len(schemaJSON) > 0 {
+		if err := writeAndValidateSchema(schemaJSON, bp.rootSchemaFile); err != nil {
+			return "", err
+		}
+		if err := files.Copy(bp.rootSchemaFile, bp.schemaFile); err != nil {
+			return "", err
+		}
+	}
+
+	dockerfileCfg, err := configWithDecoratorConcurrency(cfg, predictorInfo)
+	if err != nil {
+		return "", err
+	}
+	if err := stageObservabilityConfig(dir, dockerfileCfg.Observability, bp.buildDir); err != nil {
+		return "", err
+	}
+
+	// --- Runtime weights manifest (/.cog/weights.json) ---
+	// When managed weights are configured and a lockfile exists, project the
+	// lockfile to the minimal runtime manifest (spec §3.3) and write it into
+	// the build context so it ends up at /.cog/weights.json in the image.
+	if len(cfg.Weights) > 0 {
+		if err := writeRuntimeWeightsManifest(dir, bp.rootWeightsFile); err != nil {
+			return "", err
+		}
+		if err := files.Copy(bp.rootWeightsFile, bp.weightsFile); err != nil {
+			return "", err
+		}
+	}
+
+	// --- Docker build ---
+	var cogBaseImageName string
+
+	tmpImageId := imageName
+	isR8imImage := strings.HasPrefix(imageName, "r8.im")
+	if isR8imImage {
+		hash := sha256.New()
+		_, err := hash.Write([]byte(imageName))
+		if err != nil {
+			return "", err
+		}
+		tmpImageId = fmt.Sprintf("cog-tmp:%s", hex.EncodeToString(hash.Sum(nil)))
+	}
+
+	if dockerfileFile != "" {
+		dockerfileContents, err := os.ReadFile(dockerfileFile)
+		if err != nil {
+			return "", fmt.Errorf("Failed to read Dockerfile at %s: %w", dockerfileFile, err)
+		}
+
+		buildOpts := command.ImageBuildOptions{
+			WorkingDir:         dir,
+			DockerfileContents: string(dockerfileContents),
+			ImageName:          tmpImageId,
+			Secrets:            secrets,
+			NoCache:            noCache,
+			ProgressOutput:     progressOutput,
+			Epoch:              &config.BuildSourceEpochTimestamp,
+			ContextDir:         ".",
+			ExcludePatterns:    defaultExcludePatterns,
+		}
+		if _, err := dockerCommand.ImageBuild(ctx, buildOpts); err != nil {
+			return "", fmt.Errorf("Failed to build Docker image: %w", err)
+		}
+		if err := addConcurrencyToCustomDockerfileImage(ctx, dockerCommand, tmpImageId, dockerfileCfg.Concurrency, progressOutput, bp.buildDir); err != nil {
+			return "", err
+		}
+		if err := addTracingToCustomDockerfileImage(ctx, dockerCommand, tmpImageId, dockerfileCfg.Observability, progressOutput, bp.buildDir); err != nil {
+			return "", err
+		}
+	} else {
+		generator, err := dockerfile.NewStandardGenerator(dockerfileCfg, dir, bp.buildDir, configFilename, dockerCommand, client, true)
+		if err != nil {
+			return "", fmt.Errorf("Error creating Dockerfile generator: %w", err)
+		}
+		contextDir, err := generator.BuildDir()
+		if err != nil {
+			return "", err
+		}
+		buildContexts, err := generator.BuildContexts()
+		if err != nil {
+			return "", err
+		}
+		generator.SetStrip(strip)
+		generator.SetPrecompile(precompile)
+		generator.SetUseCudaBaseImage(useCudaBaseImage)
+		if useCogBaseImage != nil {
+			generator.SetUseCogBaseImage(*useCogBaseImage)
+		}
+
+		if generator.IsUsingCogBaseImage() {
+			cogBaseImageName, err = generator.BaseImage(ctx)
+			if err != nil {
+				return "", fmt.Errorf("Failed to get cog base image name: %s", err)
+			}
+		}
+
+		if separateWeights {
+			weightsDockerfile, runnerDockerfile, weightsExcludePatterns, err := generator.GenerateModelBaseWithSeparateWeights(ctx, imageName)
+			if err != nil {
+				return "", fmt.Errorf("Failed to generate Dockerfile: %w", err)
+			}
+
+			weightsManifest, err := generator.GenerateWeightsManifest(ctx)
+			if err != nil {
+				return "", fmt.Errorf("Failed to generate weights manifest: %w", err)
+			}
+			cachedManifest, _ := weightslegacy.LoadManifest(bp.weightsManifest)
+			changed := cachedManifest == nil || !weightsManifest.Equal(cachedManifest)
+			if changed {
+				if err := buildContextImage(ctx, dockerCommand, dir, weightsDockerfile, imageName+"-weights", secrets, noCache, progressOutput, contextDir, buildContexts, defaultExcludePatterns); err != nil {
+					return "", fmt.Errorf("Failed to build model weights Docker image: %w", err)
+				}
+				err := weightsManifest.Save(bp.weightsManifest)
+				if err != nil {
+					return "", fmt.Errorf("Failed to save weights hash: %w", err)
+				}
+			} else {
+				console.Info("Weights unchanged, skip rebuilding and use cached image...")
+			}
+
+			// Exclude weight dirs/files from the runner context so COPY . /src
+			// doesn't duplicate them (they arrive via COPY --from=weights).
+			runnerExclude := slices.Concat(defaultExcludePatterns, weightsExcludePatterns)
+			if err := buildContextImage(ctx, dockerCommand, dir, runnerDockerfile, tmpImageId, secrets, noCache, progressOutput, contextDir, buildContexts, runnerExclude); err != nil {
+				return "", fmt.Errorf("Failed to build runner Docker image: %w", err)
+			}
+		} else {
+			var dockerfileContents string
+			if excludeSource {
+				// Dev mode (cog serve): same layers as cog build but without
+				// COPY . /src — source is volume-mounted at runtime instead.
+				// This shares Docker layer cache with full builds.
+				dockerfileContents, err = generator.GenerateModelBase(ctx)
+			} else {
+				dockerfileContents, err = generator.GenerateDockerfileWithoutSeparateWeights(ctx)
+			}
+			if err != nil {
+				return "", fmt.Errorf("Failed to generate Dockerfile: %w", err)
+			}
+
+			buildOpts := command.ImageBuildOptions{
+				WorkingDir:         dir,
+				DockerfileContents: dockerfileContents,
+				ImageName:          tmpImageId,
+				Secrets:            secrets,
+				NoCache:            noCache,
+				ProgressOutput:     progressOutput,
+				Epoch:              &config.BuildSourceEpochTimestamp,
+				ContextDir:         contextDir,
+				BuildContexts:      buildContexts,
+				ExcludePatterns:    defaultExcludePatterns,
+				BuildCacheDir:      generator.BuildCacheDir(),
+			}
+
+			if _, err := dockerCommand.ImageBuild(ctx, buildOpts); err != nil {
+				return "", fmt.Errorf("Failed to build Docker image: %w", err)
+			}
+		}
+	}
+
+	bundleFiles := collectBundleFiles(schemaJSON, &bp)
+
+	// When skipLabels is true (cog exec/predict/serve/train), skip the expensive
+	// label-adding phase. This image is for local use only and won't be distributed,
+	// so we don't need metadata labels, pip freeze, or git info.
+	// We still need the schema bundled, so do a minimal second build to add it.
+	if skipLabels {
+		if len(bundleFiles) > 0 {
+			buildOpts := command.ImageBuildOptions{
+				DockerfileContents: bundleDockerfile(tmpImageId, bundleFiles),
+				ImageName:          tmpImageId,
+				ProgressOutput:     progressOutput,
+				BuildCacheDir:      bp.buildDir,
+				BuildContexts: map[string]string{
+					cogBuildContextName: bp.buildDir,
+				},
+			}
+			if _, err := dockerCommand.ImageBuild(ctx, buildOpts); err != nil {
+				return "", fmt.Errorf("Failed to bundle .cog files into image: %w", err)
+			}
+		}
+		return tmpImageId, nil
+	}
+
+	console.Info("Adding labels to image...")
+	console.Info("")
+
+	// We used to set the cog_version and config labels in Dockerfile, because we didn't require running the
+	// built image to get those. But, the escaping of JSON inside a label inside a Dockerfile was gnarly, and
+	// doesn't seem to be a problem here, so do it here instead.
+	//
+	// Marshal the effective config (dockerfileCfg) so the label reflects
+	// decorator-derived concurrency baked into the image, keeping the config
+	// label consistent with the COG_MAX_CONCURRENCY runtime env.
+	configJSON, err := json.Marshal(dockerfileCfg)
+	if err != nil {
+		return "", fmt.Errorf("Failed to convert config to JSON: %w", err)
+	}
+
+	pipFreeze, err := GeneratePipFreeze(ctx, dockerCommand, tmpImageId)
+	if err != nil {
+		return "", fmt.Errorf("Failed to generate pip freeze from image: %w", err)
+	}
+
+	labels := map[string]string{
+		command.CogVersionLabelKey:           global.Version,
+		command.CogConfigLabelKey:            string(bytes.TrimSpace(configJSON)),
+		command.CogOpenAPISchemaLabelKey:     string(schemaJSON),
+		global.LabelNamespace + "pip_freeze": pipFreeze,
+		// Mark the image as having an appropriate init entrypoint. We can use this
+		// to decide how/if to shim the image.
+		global.LabelNamespace + "has_init": "true",
+	}
+
+	if cogBaseImageName != "" {
+		labels[global.LabelNamespace+"cog-base-image-name"] = cogBaseImageName
+
+		// name.Insecure allows HTTP fallback for local/test registries,
+		// consistent with ParseReference calls in pkg/registry/.
+		ref, err := name.ParseReference(cogBaseImageName, name.Insecure)
+		if err != nil {
+			return "", fmt.Errorf("Failed to parse cog base image reference: %w", err)
+		}
+
+		img, err := remote.Image(ref)
+		if err != nil {
+			return "", fmt.Errorf("Failed to fetch cog base image: %w", err)
+		}
+
+		layers, err := img.Layers()
+		if err != nil {
+			return "", fmt.Errorf("Failed to get layers for cog base image: %w", err)
+		}
+
+		if len(layers) == 0 {
+			return "", fmt.Errorf("Cog base image has no layers: %s", cogBaseImageName)
+		}
+
+		lastLayerIndex := len(layers) - 1
+		layerLayerDigest, err := layers[lastLayerIndex].DiffID()
+		if err != nil {
+			return "", fmt.Errorf("Failed to get last layer digest for cog base image: %w", err)
+		}
+
+		lastLayer := layerLayerDigest.String()
+		console.Debugf("Last layer of the cog base image: %s", lastLayer)
+
+		labels[global.LabelNamespace+"cog-base-image-last-layer-sha"] = lastLayer
+		labels[global.LabelNamespace+"cog-base-image-last-layer-idx"] = fmt.Sprintf("%d", lastLayerIndex)
+	}
+
+	if commit, err := gitHead(ctx, dir); commit != "" && err == nil {
+		labels["org.opencontainers.image.revision"] = commit
+	} else {
+		console.Debug("Unable to determine Git commit")
+	}
+
+	if tag, err := gitTag(ctx, dir); tag != "" && err == nil {
+		labels["org.opencontainers.image.version"] = tag
+	} else {
+		console.Debug("Unable to determine Git tag")
+	}
+
+	maps.Copy(labels, annotations)
+
+	// The final image ID comes from the label-adding step.
+	imageID, err := BuildAddLabelsAndSchemaToImage(ctx, dockerCommand, tmpImageId, imageName, labels, bundleFiles, progressOutput, bp.buildDir)
+	if err != nil {
+		return "", fmt.Errorf("Failed to add labels to image: %w", err)
+	}
+
+	// We created a temp image, so delete it. Don't "-f" so it doesn't blow anything up
+	if isR8imImage {
+		if err = dockerCommand.RemoveImage(ctx, tmpImageId); err != nil {
+			return "", err
+		}
+	}
+
+	return imageID, nil
+}
+
+// BuildAddLabelsAndSchemaToImage builds a cog model with labels and bundled
+// .cog/ files. Returns the image ID (sha256:...) of the final image.
+//
+// The new image is based on the provided image with the labels and any
+// bundled files (schema, weights manifest, etc.) appended to it.
+// tmpName is the source image to build from, image is the final image name/tag.
+func BuildAddLabelsAndSchemaToImage(ctx context.Context, dockerClient command.Command, tmpName, image string, labels map[string]string, bundleFiles []string, progressOutput string, buildCacheDir string) (string, error) {
+	buildOpts := command.ImageBuildOptions{
+		DockerfileContents: bundleDockerfile(tmpName, bundleFiles),
+		ImageName:          image,
+		Labels:             labels,
+		ProgressOutput:     progressOutput,
+		BuildCacheDir:      buildCacheDir,
+		BuildContexts: map[string]string{
+			cogBuildContextName: buildCacheDir,
+		},
+	}
+
+	imageID, err := dockerClient.ImageBuild(ctx, buildOpts)
+	if err != nil {
+		return "", fmt.Errorf("Failed to add labels to image: %w", err)
+	}
+	return imageID, nil
+}
+
+// resolveBuildSchema returns the OpenAPI schema JSON to use for the build,
+// choosing among (in priority order): a pre-generated schema supplied by the
+// caller, static generation from source, an external schema file, or nothing
+// when schema validation is skipped.
+func resolveBuildSchema(cfg *config.Config, dir, schemaFile string, openAPISchema []byte, needsSchema, skipSchemaValidation bool) ([]byte, error) {
+	switch {
+	case len(openAPISchema) > 0:
+		// The caller already generated (and validated) the schema for input
+		// preflight; reuse it so validation and the image label share one
+		// source of truth instead of regenerating.
+		console.Debug("Using pre-generated model schema...")
+		return openAPISchema, nil
+	case needsSchema:
+		console.Debug("Generating model schema (static)...")
+		generatedSchema, err := openapi.GenerateSchema(cfg, dir)
+		if err != nil {
+			return nil, fmt.Errorf("image build failed: %w", err)
+		}
+		return generatedSchema, nil
+	case !skipSchemaValidation && schemaFile != "":
+		console.Infof("Validating model schema from %s...", schemaFile)
+		data, err := os.ReadFile(schemaFile)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to read schema file: %w", err)
+		}
+		return data, nil
+	case skipSchemaValidation:
+		console.Debug("Skipping model schema validation")
+	}
+	return nil, nil
+}
+
+func generatePredictorMetadata(cfg *config.Config, dir string) (*schema.PredictorInfo, error) {
+	if cfg.Predict == "" && cfg.Train == "" {
+		return nil, nil
+	}
+	if cfg.Predict != "" {
+		return schema.GenerateInfo(cfg.Predict, dir, schema.ModePredict, schema.PathAwareParser(python.ParsePredictorMetadataWithSourcePath))
+	}
+	return schema.GenerateInfo(cfg.Train, dir, schema.ModeTrain, schema.PathAwareParser(python.ParsePredictorMetadataWithSourcePath))
+}
+
+func configWithDecoratorConcurrency(cfg *config.Config, info *schema.PredictorInfo) (*config.Config, error) {
+	if cfg.Concurrency != nil && cfg.Concurrency.Max > 1 && info != nil && !info.IsAsync {
+		return nil, fmt.Errorf("concurrency.max > 1 requires an async run() or predict() method")
+	}
+	if cfg.Concurrency != nil || info == nil || info.ConcurrencyMax == nil {
+		return cfg, validateEffectiveConcurrency(cfg, info)
+	}
+	if *info.ConcurrencyMax > 1 && !info.IsAsync {
+		return nil, fmt.Errorf("@cog.concurrent(max > 1) requires an async run() or predict() method")
+	}
+	cfgCopy := *cfg
+	cfgCopy.Concurrency = &config.Concurrency{Max: *info.ConcurrencyMax}
+	return &cfgCopy, validateEffectiveConcurrency(&cfgCopy, info)
+}
+
+func addConcurrencyToCustomDockerfileImage(ctx context.Context, dockerCommand command.Command, imageName string, concurrency *config.Concurrency, progressOutput string, buildCacheDir string) error {
+	if concurrency == nil || concurrency.Max <= 0 {
+		return nil
+	}
+	buildOpts := command.ImageBuildOptions{
+		DockerfileContents: concurrencyDockerfile(imageName, concurrency.Max),
+		ImageName:          imageName,
+		ProgressOutput:     progressOutput,
+		BuildCacheDir:      buildCacheDir,
+	}
+	if _, err := dockerCommand.ImageBuild(ctx, buildOpts); err != nil {
+		return fmt.Errorf("Failed to add concurrency configuration to Docker image: %w", err)
+	}
+	return nil
+}
+
+func addTracingToCustomDockerfileImage(ctx context.Context, dockerCommand command.Command, imageName string, observability *config.Observability, progressOutput string, buildCacheDir string) error {
+	if observability == nil || observability.Traces == nil || !observability.Traces.Enabled {
+		return nil
+	}
+	imageInfo, err := dockerCommand.Inspect(ctx, imageName)
+	if err != nil {
+		return fmt.Errorf("Failed to inspect Docker image before adding tracing configuration: %w", err)
+	}
+	imageUser := ""
+	if imageInfo.Config != nil {
+		imageUser = imageInfo.Config.User
+	}
+	buildOpts := command.ImageBuildOptions{
+		DockerfileContents: tracingDockerfile(imageName, observability, imageUser),
+		ImageName:          imageName,
+		ProgressOutput:     progressOutput,
+		BuildCacheDir:      buildCacheDir,
+		BuildContexts:      map[string]string{cogBuildContextName: buildCacheDir},
+	}
+	if _, err := dockerCommand.ImageBuild(ctx, buildOpts); err != nil {
+		return fmt.Errorf("Failed to add tracing configuration to Docker image: %w", err)
+	}
+	return nil
+}
+
+func validateEffectiveConcurrency(cfg *config.Config, info *schema.PredictorInfo) error {
+	if cfg.Concurrency == nil || cfg.Concurrency.Max <= 1 {
+		return nil
+	}
+	if info != nil && !info.IsAsync {
+		return fmt.Errorf("concurrency.max > 1 requires an async run() or predict() method")
+	}
+	if cfg.Build == nil || cfg.Build.PythonVersion == "" {
+		return nil
+	}
+	major, minor, err := splitPythonVersionForBuild(cfg.Build.PythonVersion)
+	if err != nil {
+		return nil
+	}
+	if major == config.MinimumMajorPythonVersion && minor < config.MinimumMinorPythonVersionForConcurrency {
+		return fmt.Errorf("concurrency requires Python %d.%d or higher", config.MinimumMajorPythonVersion, config.MinimumMinorPythonVersionForConcurrency)
+	}
+	return nil
+}
+
+func splitPythonVersionForBuild(version string) (major int, minor int, err error) {
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return 0, 0, fmt.Errorf("invalid Python version %q", version)
+	}
+	major, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, err
+	}
+	minor, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, err
+	}
+	return major, minor, nil
+
+}
+
+// writeAndValidateSchema validates the schema JSON as a well-formed OpenAPI 3.0
+// specification, then atomically writes it to schemaPath (write-to-temp + rename).
+func writeAndValidateSchema(schemaJSON []byte, schemaPath string) error {
+	loader := openapi3.NewLoader()
+	loader.IsExternalRefsAllowed = true
+	doc, err := loader.LoadFromData(schemaJSON)
+	if err != nil {
+		return fmt.Errorf("Failed to load model schema JSON: %w", err)
+	}
+	if err := doc.Validate(loader.Context); err != nil {
+		return fmt.Errorf("Model schema is invalid: %w\n\n%s", err, string(schemaJSON))
+	}
+	return files.AtomicWrite(schemaPath, schemaJSON)
+}
+
+// writeRuntimeWeightsManifest projects the lockfile to /.cog/weights.json (spec §3.3).
+func writeRuntimeWeightsManifest(dir string, weightsPath string) error {
+	lockPath := filepath.Join(dir, weightslockfile.WeightsLockFilename)
+	lock, err := weightslockfile.LoadWeightsLock(lockPath)
+	if err != nil {
+		return fmt.Errorf("managed weights configured but no lockfile found: %w\nRun 'cog weights import' first", err)
+	}
+
+	manifest := lock.RuntimeManifest()
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize runtime weights manifest: %w", err)
+	}
+
+	if err := files.AtomicWrite(weightsPath, data); err != nil {
+		return fmt.Errorf("write runtime weights manifest: %w", err)
+	}
+	console.Debugf("Wrote runtime weights manifest to %s (%d weights)", weightsPath, len(manifest.Weights))
+	return nil
+}
+
+// collectBundleFiles returns the list of .cog/build/ files that should be
+// COPYed into the final image layer. It checks schemaJSON (non-nil = schema
+// was generated) and probes the filesystem for the weights manifest.
+func collectBundleFiles(schemaJSON []byte, bp *buildPaths) []string {
+	var files []string
+	if len(schemaJSON) > 0 {
+		files = append(files, bp.schemaFile)
+	}
+	if _, err := os.Stat(bp.weightsFile); err == nil {
+		files = append(files, bp.weightsFile)
+	}
+	return files
+}
+
+// bundleDockerfile returns a Dockerfile that COPYs build artifacts into
+// the image via the cog_build named build context. Files are referenced
+// by basename since cog_build is rooted at .cog/build/.
+func bundleDockerfile(baseImage string, files []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "FROM %s\n", baseImage)
+	for _, f := range files {
+		fmt.Fprintf(&b, "COPY --from=%s %s %s/\n", cogBuildContextName, filepath.Base(f), dotcog.Name)
+	}
+	return b.String()
+}
+
+func concurrencyDockerfile(baseImage string, maxConcurrency int) string {
+	return fmt.Sprintf("FROM %s\nENV COG_MAX_CONCURRENCY=%d\n", baseImage, maxConcurrency)
+}
+
+func tracingDockerfile(baseImage string, observability *config.Observability, imageUser string) string {
+	var b strings.Builder
+	traces := observability.Traces
+	fmt.Fprintf(&b, "FROM %s\n", baseImage)
+	if imageUser != "" {
+		fmt.Fprintln(&b, "USER root")
+	}
+	fmt.Fprintf(&b, "RUN python -m pip install --no-cache-dir --break-system-packages %s\n", dockerfile.PythonTracingRequirements)
+	if imageUser != "" {
+		fmt.Fprintf(&b, "USER %s\n", strconv.Quote(imageUser))
+	}
+	fmt.Fprintf(&b, "ENV COG_TRACE_CONFIGURED=true\nENV COG_TRACE_ENABLED=true\nENV COG_TRACE_SAMPLER=\"%s\"\n", traces.Sampler)
+	if traces.SamplerArg != "" {
+		fmt.Fprintf(&b, "ENV COG_TRACE_SAMPLER_ARG=\"%s\"\n", traces.SamplerArg)
+	}
+	if traces.TraceHeader != "" {
+		fmt.Fprintf(&b, "ENV COG_TRACE_HEADER=\"%s\"\nENV COG_TRACE_HEADER_FORMAT=\"%s\"\n", traces.TraceHeader, traces.TraceHeaderFormat)
+	}
+	if observability.Config != "" {
+		fmt.Fprintf(&b, "COPY --from=%s telemetry.py /.cog/telemetry.py\nENV COG_OBSERVABILITY_CONFIG=\"/.cog/telemetry.py\"\n", cogBuildContextName)
+	}
+	return b.String()
+}
+
+func stageObservabilityConfig(projectDir string, observability *config.Observability, buildDir string) error {
+	if observability == nil || observability.Traces == nil || !observability.Traces.Enabled || observability.Config == "" {
+		return nil
+	}
+
+	sourceRoot, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return fmt.Errorf("failed to open project directory: %w", err)
+	}
+	defer sourceRoot.Close()
+	source, err := sourceRoot.Open(observability.Config)
+	if err != nil {
+		return fmt.Errorf("failed to open observability config: %w", err)
+	}
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to inspect observability config: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("observability config must be a regular file")
+	}
+
+	destinationRoot, err := os.OpenRoot(buildDir)
+	if err != nil {
+		return fmt.Errorf("failed to open build directory: %w", err)
+	}
+	defer destinationRoot.Close()
+	destination, err := destinationRoot.OpenFile("telemetry.py", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to stage observability config: %w", err)
+	}
+	defer destination.Close()
+	if _, err := io.Copy(destination, source); err != nil {
+		return fmt.Errorf("failed to stage observability config: %w", err)
+	}
+	return nil
+}
+
+func isGitWorkTree(ctx context.Context, dir string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--is-inside-work-tree").Output()
+	if err != nil {
+		return false
+	}
+
+	return strings.TrimSpace(string(out)) == "true"
+}
+
+func gitHead(ctx context.Context, dir string) (string, error) {
+	if v, ok := os.LookupEnv("GITHUB_SHA"); ok && v != "" {
+		return v, nil
+	}
+
+	if isGitWorkTree(ctx, dir) {
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD").Output()
+		if err != nil {
+			return "", err
+		}
+
+		return string(bytes.TrimSpace(out)), nil
+	}
+
+	return "", fmt.Errorf("Failed to find HEAD commit: %w", errGit)
+}
+
+func gitTag(ctx context.Context, dir string) (string, error) {
+	if v, ok := os.LookupEnv("GITHUB_REF_NAME"); ok && v != "" {
+		return v, nil
+	}
+
+	if isGitWorkTree(ctx, dir) {
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		out, err := exec.CommandContext(ctx, "git", "-C", dir, "describe", "--tags", "--dirty").Output()
+		if err != nil {
+			return "", err
+		}
+
+		return string(bytes.TrimSpace(out)), nil
+	}
+
+	return "", fmt.Errorf("Failed to find ref name: %w", errGit)
+}
+
+func buildContextImage(ctx context.Context, dockerClient command.Command, dir, dockerfileContents, imageName string, secrets []string, noCache bool, progressOutput string, contextDir string, buildContexts map[string]string, excludePatterns []string) error {
+	buildOpts := command.ImageBuildOptions{
+		WorkingDir:         dir,
+		DockerfileContents: dockerfileContents,
+		ImageName:          imageName,
+		Secrets:            secrets,
+		NoCache:            noCache,
+		ProgressOutput:     progressOutput,
+		Epoch:              &config.BuildSourceEpochTimestamp,
+		ContextDir:         contextDir,
+		BuildContexts:      buildContexts,
+		ExcludePatterns:    excludePatterns,
+	}
+	if _, err := dockerClient.ImageBuild(ctx, buildOpts); err != nil {
+		return fmt.Errorf("Failed to build Docker image: %w", err)
+	}
+	return nil
+}

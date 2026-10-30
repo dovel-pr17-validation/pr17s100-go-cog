@@ -1,0 +1,121 @@
+package command
+
+import (
+	"context"
+	"io"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+)
+
+// PushResult identifies the manifest uploaded by a Docker push.
+type PushResult struct {
+	Digest string
+	Size   int64
+}
+
+// PushResultCommand is implemented by Docker commands that can return the
+// manifest digest reported by the daemon's push stream.
+type PushResultCommand interface {
+	PushWithResult(ctx context.Context, ref string) (PushResult, error)
+}
+
+type Command interface {
+	// Pull pulls an image from a remote registry and returns the inspect response for the local image.
+	// If the image already exists, it will return the inspect response for the local image without pulling.
+	// When force is true, it will always attempt to pull the image.
+	Pull(ctx context.Context, ref string, force bool) (*image.InspectResponse, error)
+	Push(ctx context.Context, ref string) error
+	// Tag assigns target as an additional local tag for the image
+	// referenced by source. source accepts anything `docker tag`
+	// accepts on its source side: an existing tag, a digest reference,
+	// or a raw image ID (with or without the sha256: prefix).
+	//
+	// Returns a *command.NotFoundError when source does not resolve
+	// to an image in the local daemon.
+	Tag(ctx context.Context, source, target string) error
+	RemoveImage(ctx context.Context, ref string) error
+	LoadUserInformation(ctx context.Context, registryHost string) (*UserInfo, error)
+	Inspect(ctx context.Context, ref string) (*image.InspectResponse, error)
+	ImageExists(ctx context.Context, ref string) (bool, error)
+	ContainerLogs(ctx context.Context, containerID string, w io.Writer) error
+	ContainerInspect(ctx context.Context, id string) (*container.InspectResponse, error)
+	ContainerStop(ctx context.Context, containerID string) error
+
+	// ImageBuild builds an image and returns the image ID (sha256:...) on success.
+	ImageBuild(ctx context.Context, options ImageBuildOptions) (string, error)
+	Run(ctx context.Context, options RunOptions) error
+	ContainerStart(ctx context.Context, options RunOptions) (string, error)
+
+	// ImageSave exports a Docker image as a tar stream.
+	// The caller must close the returned ReadCloser.
+	ImageSave(ctx context.Context, imageRef string) (io.ReadCloser, error)
+}
+
+type ImageBuildOptions struct {
+	WorkingDir         string
+	DockerfileContents string
+	// TODO[md]: ImageName should be renamed to Tag
+	ImageName string
+	// Secrets in the format of "id=foo,src=/path/to/file" or "id=kube,env=KUBECONFIG"
+	// docs: https://docs.docker.com/build/building/secrets/#use-secrets-in-dockerfile
+	Secrets        []string
+	NoCache        bool
+	ProgressOutput string
+	Epoch          *int64
+	ContextDir     string
+	BuildContexts  map[string]string
+	Labels         map[string]string
+
+	// ExcludePatterns are fsutil glob patterns applied to the context
+	// mount at the BuildKit session level. Matched paths are never sent
+	// to the daemon, regardless of what the user's .dockerignore says.
+	ExcludePatterns []string
+
+	// BuildCacheDir is the directory used to stage build artifacts
+	// (the generated Dockerfile, wheels, requirements.txt, schemas,
+	// etc.). When set, the Dockerfile is written here and the
+	// "dockerfile" BuildKit mount points at this directory. When
+	// empty, a temporary directory is created and cleaned up after
+	// the build.
+	//
+	// Typically equals BuildContexts["cog_build"] when both are set,
+	// since the same directory serves as both the Dockerfile location
+	// and the named build context for COPY --from=cog_build.
+	BuildCacheDir string
+
+	// only supported on buildkit client, not cli client
+	BuildArgs map[string]*string
+}
+
+// DefaultHostIP is the host interface that container ports are published on
+// when no explicit HostIP is provided. Binding to localhost-only prevents
+// prediction endpoints from being accidentally exposed to the network.
+const DefaultHostIP = "127.0.0.1"
+
+type RunOptions struct {
+	Detach     bool
+	Args       []string
+	Env        []string
+	GPUs       string
+	Image      string
+	Ports      []Port
+	Volumes    []Volume
+	Workdir    string
+	ExtraHosts []string
+	Stdin      io.Reader
+	Stdout     io.Writer
+	Stderr     io.Writer
+}
+
+type Port struct {
+	HostPort      int
+	ContainerPort int
+	HostIP        string // Host IP to bind to. Defaults to DefaultHostIP if empty.
+}
+
+type Volume struct {
+	Source      string
+	Destination string
+	ReadOnly    bool
+}

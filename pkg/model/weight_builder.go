@@ -1,0 +1,475 @@
+package model
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"strings"
+	"time"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/types"
+
+	"github.com/replicate/cog/pkg/model/weightsource"
+	"github.com/replicate/cog/pkg/util/console"
+	"github.com/replicate/cog/pkg/weights/lockfile"
+	"github.com/replicate/cog/pkg/weights/store"
+)
+
+// resolvedSource holds the resolved inventory for a single source
+// within a multi-source weight.
+type resolvedSource struct {
+	source   weightsource.Source
+	full     weightsource.Inventory // before filtering (carries fingerprint)
+	filtered weightsource.Inventory // after include/exclude
+}
+
+// resolvedInventory holds the results of walking one or more weight
+// sources and applying include/exclude filters. Both PlanImport and
+// Build share this step; caching the result avoids re-walking the
+// source when the CLI plans first and then builds.
+//
+// There is deliberately no combined fingerprint at this level: every
+// drift/fast-path check operates on per-source fingerprints
+// (perSource[i].full.Fingerprint), which preserves the v1 lockfile
+// format for single-source weights and lets multi-source weights
+// surface drift on individual sources rather than on an opaque hash.
+type resolvedInventory struct {
+	perSource []resolvedSource
+	// mergedFiles is the union of every source's filtered files,
+	// de-duplicated by path with last-in-wins (declaration-order
+	// layering) and sorted. This is what the packer/planner consume.
+	mergedFiles []weightsource.InventoryFile
+	// owners maps each file path to the source that provides it, so
+	// ingressFromInventory knows which Source.Open() to call.
+	owners map[string]weightsource.Source
+}
+
+// unfilteredFiles returns the de-duplicated, sorted union of all
+// per-source full (unfiltered) inventories. Used by PlanImport to
+// show the user which files were excluded by include/exclude patterns.
+func (r *resolvedInventory) unfilteredFiles() []weightsource.InventoryFile {
+	seen := make(map[string]weightsource.InventoryFile)
+	for _, ps := range r.perSource {
+		for _, f := range ps.full.Files {
+			seen[f.Path] = f // last-in-wins like the merge loop
+		}
+	}
+	files := make([]weightsource.InventoryFile, 0, len(seen))
+	for _, f := range seen {
+		files = append(files, f)
+	}
+	weightsource.SortInventoryFiles(files)
+	return files
+}
+
+// resolveInventory walks each source, applies per-source filters, merges
+// the results, and returns the resolved inventory. This is the shared
+// preamble for PlanImport and Build.
+func (b *WeightBuilder) resolveInventory(ctx context.Context, ws *WeightSpec) (*resolvedInventory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	perSource := make([]resolvedSource, len(ws.Sources))
+	owners := make(map[string]weightsource.Source)
+	mergedFiles := make(map[string]weightsource.InventoryFile)
+
+	for i, srcSpec := range ws.Sources {
+		src, err := weightsource.For(srcSpec.URI, b.projectDir())
+		if err != nil {
+			return nil, err
+		}
+
+		full, err := src.Inventory(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("inventory weight %q source[%d]: %w", ws.Name(), i, err)
+		}
+
+		filtered, err := weightsource.FilterInventory(full, srcSpec.Include, srcSpec.Exclude)
+		if err != nil {
+			return nil, fmt.Errorf("filter weight %q source[%d]: %w", ws.Name(), i, err)
+		}
+
+		perSource[i] = resolvedSource{source: src, full: full, filtered: filtered}
+
+		// Merge filtered files: last-in-wins for conflicts (declaration
+		// order = layering order, like CSS). Surface overrides at info
+		// level — silent shadowing is easy to miss in cog.yaml diffs.
+		for _, f := range filtered.Files {
+			if _, exists := mergedFiles[f.Path]; exists {
+				console.Infof("weight %q: source[%d] (%s) overrides %s",
+					ws.Name(), i, srcSpec.URI, f.Path)
+			}
+			mergedFiles[f.Path] = f
+			owners[f.Path] = src
+		}
+	}
+
+	// Build sorted merged file list.
+	files := make([]weightsource.InventoryFile, 0, len(mergedFiles))
+	for _, f := range mergedFiles {
+		files = append(files, f)
+	}
+	weightsource.SortInventoryFiles(files)
+
+	return &resolvedInventory{
+		perSource:   perSource,
+		mergedFiles: files,
+		owners:      owners,
+	}, nil
+}
+
+// WeightBuildProgress reports aggregate download progress for one weight.
+type WeightBuildProgress struct {
+	WeightName string
+	Complete   int64
+	Total      int64
+	Done       bool
+}
+
+// WeightBuilder is the weight factory: given a WeightSpec (source URI +
+// target), it ingresses the source files into the local
+// content-addressed store, plans tar layers, derives layer digests
+// (cache-fast or recompute), assembles the v1 OCI manifest, and
+// returns a WeightArtifact carrying the layer descriptors and
+// manifest digest.
+//
+// `cog weights import` ≡ `cog weights import + cog weights pull` —
+// the build path leaves the local store warm so subsequent `cog
+// predict` invocations can hardlink-assemble without a separate pull.
+//
+// The builder is offline: it never talks to a registry. The manifest
+// digest it writes into the artifact descriptor is a sha256 of the
+// serialized manifest bytes.
+type WeightBuilder struct {
+	source     *Source
+	store      store.Store
+	lockPath   string
+	progressFn func(WeightBuildProgress)
+}
+
+// NewWeightBuilder creates a WeightBuilder.
+//
+// st is the local content-addressed weight store. lockPath is where
+// weights.lock is read/written.
+func NewWeightBuilder(source *Source, st store.Store, lockPath string) *WeightBuilder {
+	return &WeightBuilder{source: source, store: st, lockPath: lockPath}
+}
+
+// SetProgressFn sets an optional callback for aggregate download progress.
+func (b *WeightBuilder) SetProgressFn(fn func(WeightBuildProgress)) {
+	b.progressFn = fn
+}
+
+// Build runs the full import pipeline for one weight:
+//
+//  1. Inventory the source.
+//  2. Ingress every file into the local store (skipping already-present
+//     digests). Hash mismatches surface here.
+//  3. Decide whether to trust the lockfile's recorded layer digests
+//     (fast path) or recompute them by streaming from the store
+//     (recompute path).
+//  4. Assemble the OCI manifest.
+//  5. Stamp the current envelope format into the lockfile and rewrite
+//     it iff anything actually changed.
+//
+// The push path is independent of Build; the caller is responsible
+// for handing the returned artifact to the pusher (which checks
+// per-layer with BlobExists before uploading).
+func (b *WeightBuilder) Build(ctx context.Context, spec ArtifactSpec) (Artifact, error) {
+	return b.buildWithResolved(ctx, spec, nil)
+}
+
+// BuildFromPlan is like Build but reuses a pre-computed inventory from
+// PlanImport, avoiding a second walk/hash of the source.
+func (b *WeightBuilder) BuildFromPlan(ctx context.Context, spec ArtifactSpec, plan *WeightImportPlan) (Artifact, error) {
+	return b.buildWithResolved(ctx, spec, plan.Resolved)
+}
+
+func (b *WeightBuilder) buildWithResolved(ctx context.Context, spec ArtifactSpec, cached *resolvedInventory) (Artifact, error) {
+	ws, ok := spec.(*WeightSpec)
+	if !ok {
+		return nil, fmt.Errorf("weight builder: expected *WeightSpec, got %T", spec)
+	}
+	if b.store == nil {
+		return nil, fmt.Errorf("weight builder: store is required")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Step 1: resolve inventory (reuse cached if available).
+	resolved := cached
+	if resolved == nil {
+		var err error
+		resolved, err = b.resolveInventory(ctx, ws)
+		if err != nil {
+			return nil, err
+		}
+	}
+	inv := weightsource.Inventory{Files: resolved.mergedFiles}
+
+	// Step 2: ingress the filtered files into the local store.
+	if err := ingressFromInventoryWithProgress(ctx, ws.Name(), resolved.owners, b.store, inv, b.progressFn); err != nil {
+		return nil, fmt.Errorf("populate store for weight %q: %w", ws.Name(), err)
+	}
+
+	// Step 3: decide fast-path vs recompute.
+	lock, err := loadLockfileOrEmpty(b.lockPath)
+	if err != nil {
+		return nil, err
+	}
+
+	currentEnvelope, err := computeEnvelopeFormat(envelopeFromOptions(packOptions{}))
+	if err != nil {
+		return nil, fmt.Errorf("compute envelope format: %w", err)
+	}
+
+	existing := lock.FindWeight(ws.Name())
+	pkr := newPacker(nil)
+	plan := pkr.planLayers(inv)
+	if len(plan.Layers) == 0 {
+		return nil, fmt.Errorf("weight %q: inventory is empty", ws.Name())
+	}
+
+	var layers []packedLayer
+	if canFastPath(lock, currentEnvelope, existing, ws, resolved) {
+		layers, err = layersFromLockfile(existing, plan)
+		if err != nil {
+			// Recompute to recover; log so a real cog bug (envelope
+			// didn't capture a packer change) is diagnosable instead
+			// of silently masked.
+			console.Debugf("weight %q: lockfile fast-path failed (%v); recomputing", ws.Name(), err)
+			layers = nil
+		}
+	}
+	if layers == nil {
+		layers, err = pkr.computeLayerDigests(ctx, b.store, plan)
+		if err != nil {
+			return nil, fmt.Errorf("compute layer digests for weight %q: %w", ws.Name(), err)
+		}
+	}
+
+	lockSources := make([]lockfile.WeightLockSource, len(resolved.perSource))
+	for i, rs := range resolved.perSource {
+		lockSources[i] = lockfile.WeightLockSource{
+			URI:         ws.Sources[i].URI,
+			Fingerprint: rs.full.Fingerprint,
+			Include:     ws.Sources[i].Include,
+			Exclude:     ws.Sources[i].Exclude,
+		}
+	}
+
+	entry := newWeightLockEntry(
+		ws.Name(), ws.Target,
+		lockSources,
+		time.Now().UTC(),
+		packedFilesFromPlan(layers),
+		layers,
+	)
+
+	// buildWeightArtifact populates entry.Digest (the manifest
+	// digest), which EntriesEqual needs to compare meaningfully.
+	artifact, err := buildWeightArtifact(&entry, layers, b.store)
+	if err != nil {
+		return nil, fmt.Errorf("weight %q: %w", ws.Name(), err)
+	}
+
+	// Preserve the original ImportedAt on a content-equal rewrite so
+	// a format-bump-only rewrite doesn't churn the timestamp.
+	// EntriesEqual ignores ImportedAt by design, so this comparison
+	// answers "would the lockfile diff be only the timestamp?"
+	entryEqualsExisting := lockfile.EntriesEqual(existing, &entry)
+	if entryEqualsExisting {
+		entry.ImportedAt = existing.ImportedAt
+	}
+
+	// Step 5: stamp envelope + rewrite iff anything changed.
+	formatChanged := lock.EnvelopeFormat != currentEnvelope
+	lock.EnvelopeFormat = currentEnvelope
+	if formatChanged || !entryEqualsExisting {
+		lock.Upsert(entry)
+		if err := lock.Save(b.lockPath); err != nil {
+			return nil, fmt.Errorf("update lockfile: %w", err)
+		}
+	}
+
+	return artifact, nil
+}
+
+// projectDir returns the builder's project directory, or "" if the
+// builder was constructed without a Source.
+func (b *WeightBuilder) projectDir() string {
+	if b.source == nil {
+		return ""
+	}
+	return b.source.ProjectDir
+}
+
+// canFastPath reports whether the recorded lockfile entry can be
+// trusted as-is for this build, allowing us to skip the
+// digest-recomputation pass.
+//
+// Every input that determines layer bytes must agree:
+//
+//   - The recorded EnvelopeFormat matches the current packer config.
+//     A miss here means cog itself produces different bytes for the
+//     same inventory than the version that wrote the lockfile did.
+//   - An entry with this name exists.
+//   - The user-intent fields (target, URI, include/exclude) match.
+//   - The source's fingerprint matches what the lockfile recorded.
+//     For file:// the fingerprint is the dirhash of the file set,
+//     so matching fingerprint ⇒ matching files. For hf:// it's the
+//     commit SHA, so matching fingerprint ⇒ same canonical files.
+//
+// Anything missing pushes us onto the recompute path. Recompute is
+// cheap because the store is already warm (local I/O + sha256 +
+// gzip) — the cost is local CPU, not network or source-side I/O.
+func canFastPath(
+	lock *lockfile.WeightsLock,
+	currentEnvelope string,
+	existing *lockfile.WeightLockEntry,
+	ws *WeightSpec,
+	resolved *resolvedInventory,
+) bool {
+	if lock.EnvelopeFormat != currentEnvelope {
+		return false
+	}
+	if existing == nil {
+		return false
+	}
+	if existing.Target != ws.Target {
+		return false
+	}
+	if len(existing.Sources) != len(ws.Sources) {
+		return false
+	}
+	for i := range ws.Sources {
+		es := existing.Sources[i]
+		ss := ws.Sources[i]
+		if es.URI != ss.URI ||
+			!slices.Equal(es.Include, ss.Include) ||
+			!slices.Equal(es.Exclude, ss.Exclude) {
+			return false
+		}
+	}
+	// Check fingerprints per-source. Length equality is guaranteed by
+	// the guard above (len(ws.Sources) == len(resolved.perSource) by
+	// construction in resolveInventory).
+	for i := range existing.Sources {
+		if existing.Sources[i].Fingerprint != resolved.perSource[i].full.Fingerprint {
+			return false
+		}
+	}
+	return true
+}
+
+// layersFromLockfile reconstructs []packedLayer from a lockfile entry,
+// pairing each recorded layer with the corresponding layerPlan from
+// the freshly-planned layout. The plan is what reproduces layer bytes
+// during push, so the planning result must be available even on the
+// fast path.
+//
+// Returns an error if the lockfile and plan disagree on how many
+// layers there are or which files they contain — a strong signal
+// that the lockfile is out of sync, which makes the fast path
+// unsafe.
+func layersFromLockfile(entry *lockfile.WeightLockEntry, pl plan) ([]packedLayer, error) {
+	if len(entry.Layers) != len(pl.Layers) {
+		return nil, fmt.Errorf("layer count mismatch: lockfile has %d, plan has %d", len(entry.Layers), len(pl.Layers))
+	}
+
+	// Index plan layers by their content signature so we can match
+	// them to lockfile layers regardless of ordering. Signature is
+	// the sorted file digests within the layer; that's what
+	// determines the tar bytes.
+	planByKey := make(map[string]layerPlan, len(pl.Layers))
+	for _, lp := range pl.Layers {
+		planByKey[layerKey(lp)] = lp
+	}
+
+	out := make([]packedLayer, 0, len(entry.Layers))
+	for _, lk := range entry.Layers {
+		// Find the plan layer whose files match this locked layer.
+		// We compare by file digests (the file→layer mapping in
+		// entry.Files tells us which files belong to this layer).
+		want := lockedLayerKey(entry, lk.Digest)
+		lp, ok := planByKey[want]
+		if !ok {
+			return nil, fmt.Errorf("locked layer %s has no matching plan layer", lk.Digest)
+		}
+		hash, err := v1.NewHash(lk.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("parse locked layer digest %s: %w", lk.Digest, err)
+		}
+		out = append(out, packedLayer{
+			Plan:             lp,
+			Digest:           hash,
+			Size:             lk.Size,
+			UncompressedSize: lk.SizeUncompressed,
+			MediaType:        types.MediaType(lk.MediaType),
+		})
+	}
+	return out, nil
+}
+
+// loadLockfileOrEmpty loads the lockfile at path. A missing file is not
+// an error — it yields a fresh empty lockfile.
+func loadLockfileOrEmpty(path string) (*lockfile.WeightsLock, error) {
+	lock, err := lockfile.LoadWeightsLock(path)
+	if err == nil {
+		return lock, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return &lockfile.WeightsLock{Version: lockfile.Version}, nil
+	}
+	return nil, err
+}
+
+// fileSetKey joins file identities into a single string that serves as
+// a content signature. Files must already be in the intended order
+// (the packer's tar-emission order). Two file sets with identical keys
+// produce identical tar bytes and therefore identical layer digests
+// (modulo envelope-format concerns, which the caller handles
+// separately).
+//
+// Both path and digest are included because tar headers contain the
+// file path — two files with identical content but different paths
+// produce different tar bytes and therefore different layer digests.
+func fileSetKey(parts []weightsource.DirhashPart) string {
+	ids := make([]string, len(parts))
+	for i, p := range parts {
+		ids[i] = p.String()
+	}
+	return strings.Join(ids, "\n")
+}
+
+// layerKey returns the fileSetKey for a planned layer.
+func layerKey(lp layerPlan) string {
+	parts := make([]weightsource.DirhashPart, len(lp.Files))
+	for i, f := range lp.Files {
+		parts[i] = f.DirhashParts()
+	}
+	return fileSetKey(parts)
+}
+
+// lockedLayerKey returns the fileSetKey for a recorded layer in entry,
+// reconstructed by collecting the files that point at the given
+// layerDigest and sorting them by path to match the packer's emission
+// order.
+func lockedLayerKey(entry *lockfile.WeightLockEntry, layerDigest string) string {
+	var parts []weightsource.DirhashPart
+	for _, f := range entry.Files {
+		if f.Layer == layerDigest {
+			parts = append(parts, weightsource.DirhashPart{Path: f.Path, Digest: f.Digest})
+		}
+	}
+	slices.SortFunc(parts, func(a, b weightsource.DirhashPart) int {
+		return strings.Compare(a.Path, b.Path)
+	})
+	return fileSetKey(parts)
+}

@@ -1,0 +1,376 @@
+# CLI reference
+
+<!-- This file is auto-generated. Do not edit manually. -->
+
+## `cog`
+
+Containers for machine learning.
+
+To get started, take a look at the documentation:
+https://github.com/replicate/cog
+
+**Examples**
+
+```
+   To execute a command inside a Docker environment defined with Cog:
+      $ cog exec echo hello world
+```
+
+**Options**
+
+```
+      --debug      Show debugging output
+  -h, --help       help for cog
+      --no-color   Disable colored output
+      --version    Show version of Cog
+```
+
+## `cog build`
+
+Build a Docker image from the cog.yaml in the current directory.
+
+The generated image contains your model code, dependencies, and the Cog
+runtime. It can be run locally with 'cog run' or pushed to a registry
+with 'cog push'.
+
+```
+cog build [flags]
+```
+
+**Examples**
+
+```
+  # Build with default settings
+  cog build
+
+  # Build and tag the image
+  cog build -t my-model:latest
+
+  # Build without using the cache
+  cog build --no-cache
+
+  # Build with model weights in a separate layer
+  cog build --separate-weights -t my-model:v1
+```
+
+**Options**
+
+```
+  -f, --file string                  The name of the config file. (default "cog.yaml")
+  -h, --help                         help for build
+      --no-cache                     Do not use cache when building the image
+      --openapi-schema string        Load OpenAPI schema from a file
+      --progress string              Set type of build progress output, 'auto' (default), 'tty', 'plain', or 'quiet' (default "auto")
+      --secret stringArray           Secrets to pass to the build environment in the form 'id=foo,src=/path/to/file'
+      --separate-weights             Separate model weights from code in image layers
+  -t, --tag string                   A name for the built image in the form 'repository:tag'
+      --use-cog-base-image           Use pre-built Cog base image for faster cold boots (default true)
+      --use-cuda-base-image string   Use Nvidia CUDA base image, 'true' (default) or 'false' (use python base image). False results in a smaller image but may cause problems for non-torch projects (default "auto")
+```
+
+## `cog doctor`
+
+Diagnose and fix common issues in your Cog project.
+
+NOTE: cog doctor is experimental. Behavior and checks may change in future versions.
+
+By default, cog doctor reports problems without modifying any files.
+Pass --fix to automatically apply safe fixes.
+
+```
+cog doctor [flags]
+```
+
+**Options**
+
+```
+  -f, --file string   The name of the config file. (default "cog.yaml")
+      --fix           Automatically apply fixes
+  -h, --help          help for doctor
+```
+
+## `cog exec`
+
+Execute a command inside a Docker environment defined by cog.yaml.
+
+Cog builds a temporary image from your cog.yaml configuration and runs the
+given command inside it. This is useful for debugging, running scripts, or
+exploring the environment your model will run in.
+
+```
+cog exec <command> [arg...] [flags]
+```
+
+**Examples**
+
+```
+  # Open a Python interpreter inside the model environment
+  cog exec python
+
+  # Run a script
+  cog exec python train.py
+
+  # Run with environment variables
+  cog exec -e HUGGING_FACE_HUB_TOKEN=abc123 python download.py
+
+  # Expose a port (e.g. for Jupyter)
+  cog exec -p 8888 jupyter notebook
+```
+
+**Options**
+
+```
+  -e, --env stringArray              Environment variables, in the form name=value
+  -f, --file string                  The name of the config file. (default "cog.yaml")
+      --gpus docker run --gpus       GPU devices to add to the container, in the same format as docker run --gpus.
+  -h, --help                         help for exec
+      --progress string              Set type of build progress output, 'auto' (default), 'tty', 'plain', or 'quiet' (default "auto")
+  -p, --publish stringArray          Publish a container's port to the host, e.g. -p 8000 or -p 0.0.0.0:8000
+      --use-cog-base-image           Use pre-built Cog base image for faster cold boots (default true)
+      --use-cuda-base-image string   Use Nvidia CUDA base image, 'true' (default) or 'false' (use python base image). False results in a smaller image but may cause problems for non-torch projects (default "auto")
+```
+
+## `cog init`
+
+Create a cog.yaml and run.py in the current directory.
+
+These files provide a starting template for defining your model's environment
+and run interface. Edit them to match your model's requirements.
+
+```
+cog init [flags]
+```
+
+**Examples**
+
+```
+  # Set up a new Cog project in the current directory
+  cog init
+```
+
+**Options**
+
+```
+  -h, --help   help for init
+```
+
+## `cog login`
+
+Log in to a container registry.
+
+For Replicate's registry (r8.im), this command handles authentication
+through Replicate's token-based flow.
+
+For other registries, this command prompts for username and password,
+then stores credentials using Docker's credential system.
+
+```
+cog login [flags]
+```
+
+**Options**
+
+```
+  -h, --help          help for login
+      --token-stdin   Pass login token on stdin instead of opening a browser. You can find your Replicate login token at https://replicate.com/auth/token
+```
+
+## `cog playground`
+
+Open a browser playground for talking to a running model.
+
+Starts a local web server that serves a schema-driven UI (a Postman-like tool
+for Cog models). Point it at any running Cog HTTP API -- for example one started
+with 'cog serve' -- and the playground reflects that model's inputs and outputs
+from its OpenAPI schema in real time.
+
+Requests are reverse-proxied through this server, so the target API does not
+need to set CORS headers. The server also hosts a webhook sink so async
+predictions can be observed in the browser.
+
+Async/webhook testing against a containerized model requires the webhook URL to
+be reachable from inside the container. On Docker Desktop the default
+'host.docker.internal' works once the server listens on a reachable interface
+(e.g. --host 0.0.0.0).
+
+```
+cog playground [flags]
+```
+
+**Examples**
+
+```
+  # Start a model API in one terminal
+  cog serve -p 8393
+
+  # Open the playground pointing at it
+  cog playground --target http://localhost:8393
+```
+
+**Options**
+
+```
+  -h, --help                  help for playground
+      --host string           Address to bind (use 0.0.0.0 to receive webhooks from containers) (default "127.0.0.1")
+      --no-open               Do not open the browser automatically
+  -p, --port int              Port to listen on (0 picks a free port)
+      --target string         Default target model API URL (default "http://localhost:8393")
+      --webhook-host string   Hostname the model uses to reach this server for webhooks (default "host.docker.internal")
+```
+
+## `cog push`
+
+Build from cog.yaml and push to an OCI-compliant registry. Run 'cog login'
+first when pushing to Replicate's registry (r8.im).
+
+TARGET overrides the configured destination and all COG_MODEL\* environment
+variables. It doesn't change the project format: projects configured with
+'image' push an image, while projects configured with 'model' push an OCI
+bundle. Push targets must use tags, not digests. Untagged image targets use
+Docker's default 'latest' tag; untagged bundle targets get a timestamp tag.
+
+With --json, Cog writes one versioned JSON result to stdout after the entire
+push succeeds. Progress, warnings, and diagnostics continue on stderr. Every
+reference in the result is digest-pinned.
+
+```
+cog push [TARGET] [flags]
+```
+
+**Examples**
+
+```
+  # Push an image to Replicate
+  cog push r8.im/your-username/my-model
+
+  # Push an image to any OCI registry
+  cog push registry.example.com/your-username/model-name
+
+  # Push a bundle project and print its immutable references as JSON
+  cog push registry.example.com/your-username/model-name:v1 --json
+
+  # Push with model weights in a separate image layer (Replicate only)
+  cog push r8.im/your-username/my-model --separate-weights
+```
+
+**Options**
+
+```
+  -f, --file string                  The name of the config file. (default "cog.yaml")
+  -h, --help                         help for push
+      --json                         Output the pushed references as JSON
+      --no-cache                     Do not use cache when building the image
+      --openapi-schema string        Load OpenAPI schema from a file
+      --progress string              Set type of build progress output, 'auto' (default), 'tty', 'plain', or 'quiet' (default "auto")
+      --secret stringArray           Secrets to pass to the build environment in the form 'id=foo,src=/path/to/file'
+      --separate-weights             Separate model weights from code in image layers
+      --use-cog-base-image           Use pre-built Cog base image for faster cold boots (default true)
+      --use-cuda-base-image string   Use Nvidia CUDA base image, 'true' (default) or 'false' (use python base image). False results in a smaller image but may cause problems for non-torch projects (default "auto")
+```
+
+## `cog run`
+
+Run the model.
+
+If 'image' is passed, it will run the model on that Docker image.
+It must be an image that has been built by Cog.
+
+Otherwise, it will build the model in the current directory and run
+it.
+
+```
+cog run [image] [flags]
+```
+
+**Examples**
+
+```
+  # Run the model with named inputs
+  cog run -i prompt="a photo of a cat"
+
+  # Pass a file as input
+  cog run -i image=@photo.jpg
+
+  # Save output to a file
+  cog run -i image=@input.jpg -o output.png
+
+  # Pass multiple inputs
+  cog run -i prompt="sunset" -i width=1024 -i height=768
+
+  # Run against a pre-built image
+  cog run r8.im/your-username/my-model -i prompt="hello"
+
+  # Pass inputs as JSON
+  echo '{"prompt": "a cat"}' | cog run --json @-
+```
+
+**Options**
+
+```
+  -e, --env stringArray              Environment variables, in the form name=value
+  -f, --file string                  The name of the config file. (default "cog.yaml")
+      --gpus docker run --gpus       GPU devices to add to the container, in the same format as docker run --gpus.
+  -h, --help                         help for run
+  -i, --input stringArray            Inputs, in the form name=value. if value is prefixed with @, then it is read from a file on disk. E.g. -i path=@image.jpg
+      --json string                  Pass inputs as JSON object, read from file (@inputs.json) or via stdin (@-)
+  -o, --output string                Output path
+      --progress string              Set type of build progress output, 'auto' (default), 'tty', 'plain', or 'quiet' (default "auto")
+      --setup-timeout uint32         The timeout for a container to setup (in seconds). (default 300)
+      --use-cog-base-image           Use pre-built Cog base image for faster cold boots (default true)
+      --use-cuda-base-image string   Use Nvidia CUDA base image, 'true' (default) or 'false' (use python base image). False results in a smaller image but may cause problems for non-torch projects (default "auto")
+      --use-replicate-token          Pass REPLICATE_API_TOKEN from local environment into the model context
+```
+
+## `cog serve`
+
+Run an HTTP server.
+
+Builds the model and starts an HTTP server that exposes the model's inputs
+and outputs as a REST API. Compatible with the Cog HTTP protocol.
+
+By default the container port is published on 127.0.0.1 (localhost), so the
+server is only reachable from your local machine. The server process inside
+the container binds to 0.0.0.0; use --host to control which host interface
+the Docker port mapping is published on.
+
+```
+cog serve [flags]
+```
+
+**Examples**
+
+```
+  # Start the server on the default port (8393)
+  cog serve
+
+  # Start on a custom port
+  cog serve -p 5000
+
+  # Start the playground alongside the model
+  cog serve --playground
+
+  # Listen on all interfaces (e.g. to expose to the network)
+  cog serve --host 0.0.0.0
+
+  # Test the server
+  curl http://localhost:8393/predictions \
+    -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"input": {"prompt": "a cat"}}'
+```
+
+**Options**
+
+```
+  -f, --file string                  The name of the config file. (default "cog.yaml")
+      --gpus docker run --gpus       GPU devices to add to the container, in the same format as docker run --gpus.
+  -h, --help                         help for serve
+      --host string                  Host IP to publish the container port on. Use 0.0.0.0 to allow connections from other machines. (default "127.0.0.1")
+      --playground                   Start the playground alongside the model
+      --playground-port int          Port for the playground (0 picks a free port) (default 9000)
+  -p, --port int                     Port on which to listen (default 8393)
+      --progress string              Set type of build progress output, 'auto' (default), 'tty', 'plain', or 'quiet' (default "auto")
+      --upload-url string            Upload URL for file outputs (e.g. https://example.com/upload/)
+      --use-cog-base-image           Use pre-built Cog base image for faster cold boots (default true)
+      --use-cuda-base-image string   Use Nvidia CUDA base image, 'true' (default) or 'false' (use python base image). False results in a smaller image but may cause problems for non-torch projects (default "auto")
+```

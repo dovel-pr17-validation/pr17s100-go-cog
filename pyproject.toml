@@ -1,0 +1,154 @@
+[build-system]
+requires = ["setuptools", "setuptools_scm[toml]"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cog"
+description = "Containers for machine learning"
+readme = "README.md"
+authors = [{ name = "Replicate", email = "team@replicate.com" }]
+license.file = "LICENSE"
+urls."Source" = "https://github.com/replicate/cog"
+
+classifiers = [
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+requires-python = ">=3.10"
+
+dependencies = [
+  "typing_extensions>=4.0",
+  "pyyaml>=6.0",
+  "structlog>=21.0.0",
+  "requests>=2.25.0",
+  "coglet>=0.1.0,<1.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+tracing = [
+  "opentelemetry-api==1.44.0",
+  "opentelemetry-sdk==1.44.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
+]
+
+[dependency-groups]
+dev = [
+    "build>=1.2.2.post1",
+    "ruff",
+    "setuptools-scm>=8.2.0",
+]
+
+test = [
+    "pytest",
+    "pytest-timeout",
+    "pytest-xdist",
+    "pytest-cov",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
+]
+
+[tool.setuptools_scm]
+write_to = "python/cog/_version.py"
+
+[tool.pyright]
+# TODO: remove this and bring the codebase inline with the current default
+strictParameterNoneValue = false
+# legacy behavior, fixed in PEP688
+disableBytesTypePromotions = true
+include = ["python"]
+exclude = ["python/tests"]
+reportMissingParameterType = "error"
+reportUnknownLambdaType = "error"
+reportUnnecessaryIsInstance = "warning"
+reportUnnecessaryComparison = "warning"
+reportUnnecessaryContains = "warning"
+reportMissingTypeArgument = "error"
+reportUnusedExpression = "warning"
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["cog*"]
+exclude = ["tests*"]
+
+[tool.pylint.main]
+disable = [
+  "C0114", # Missing module docstring
+  "C0115", # Missing class docstring
+  "C0116", # Missing function or method docstring
+  "C0301", # Line too long
+  "C0413", # Import should be placed at the top of the module
+  "R0903", # Too few public methods
+  "W0622", # Redefining built-in
+]
+good-names = ["id", "input"]
+
+ignore-paths = ["python/cog/_version.py", "python/tests"]
+
+[tool.ruff]
+exclude = ["python/cog/_version.py"]
+lint.select = [
+  "E",   # pycodestyle error
+  "F",   # Pyflakes
+  "I",   # isort
+  "W",   # pycodestyle warning
+  "S",   # flake8-bandit
+  "B",   # flake8-bugbear
+  "ANN", # flake8-annotations
+]
+lint.ignore = [
+  "E501",   # Line too long
+  "S101",   # Use of `assert` detected"
+  "S113",   # Probable use of requests call without timeout
+  "B008",   # Do not perform function call in argument defaults
+  "ANN001", # Missing type annotation for function argument
+  "ANN002", # Missing type annotation for `*args`
+  "ANN003", # Missing type annotation for `**kwargs`
+  "ANN401", # Dynamically typed expressions are disallowed
+]
+extend-exclude = [
+  "python/tests/server/fixtures/*",
+  "crates/coglet-python/**/*.pyi",
+  "crates/coglet-python/scripts/*",
+]
+src = ["python"]
+
+[tool.ruff.lint.per-file-ignores]
+"python/cog/server/http.py" = [
+  "S104", # Possible binding to all interfaces
+]
+"python/tests/*" = [
+  "S101", # Use of assert
+  "S104", # Possible binding to all interfaces
+  "S105", # Possible hardcoded password
+  "S106", # Possible hardcoded password in argument
+  "S108", # Probable insecure usage of temp file
+  "S110", # try-except-pass
+  "S301", # pickle can be unsafe when used to deserialize untrusted data
+  "S603", # subprocess call — tests use subprocess for isolation
+  "ANN",  # Type annotations not required in tests
+  "B011", # Do not assert False
+]
+"crates/coglet-python/tests/*" = [
+  "S101", # Use of assert
+  "S104", # Possible binding to all interfaces
+  "S110", # try-except-pass
+  "S603", # subprocess call
+  "ANN",  # Type annotations not required in tests
+  "B904", # raise from
+]
+"tools/test-harness/*" = [
+  "S310", # URL open — URLs are hardcoded to https://
+  "S603", # subprocess call — harness invokes cog/docker/git by design
+  "S607", # partial executable path — cog/docker/git resolved via PATH
+  "ANN",  # Type annotations not required in tooling
+]
