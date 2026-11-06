@@ -1,6 +1,6 @@
 module github.com/replicate/cog
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/anaskhan96/soup v1.2.5
@@ -38,7 +38,7 @@ require (
 	golang.org/x/crypto v0.52.0
 	golang.org/x/exp v0.0.0-20250911091902-df9299821621
 	golang.org/x/sync v0.20.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.49.0
 	golang.org/x/term v0.43.0
 	google.golang.org/grpc v1.82.1
 	gopkg.in/yaml.v3 v3.0.1
